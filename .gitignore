@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Downloaded model weights
+*.pt
+
+# Generated pose signal streams
+*.jsonl
