@@ -1,3 +1,4 @@
 ultralytics>=8.3
 opencv-python>=4.10
 torch>=2.2
+mediapipe>=0.10

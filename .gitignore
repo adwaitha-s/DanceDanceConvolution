@@ -5,6 +5,8 @@ venv/
 
 # Downloaded model weights
 *.pt
+*.task
+models/
 
 # Generated pose signal streams
 *.jsonl

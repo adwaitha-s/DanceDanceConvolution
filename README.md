@@ -1,9 +1,14 @@
 # DanceDanceConvolution
 
-Pose-detection demo: runs YOLO11 pose estimation on a webcam, video, or image,
-shows an annotated preview, and streams per-frame keypoint signals as JSON
-Lines so a separate process (e.g. a model consuming pose-sequence windows)
-can pick them up.
+Pose-detection demos: run pose estimation on a webcam, video, or image, show
+an annotated preview, and stream per-frame keypoint signals as JSON Lines so
+a separate process (e.g. a model consuming pose-sequence windows) can pick
+them up. Two detectors are included:
+
+- **`pose_demo.py`** -- YOLO11 pose. Fast, 17-keypoint COCO body pose only
+  (no hands).
+- **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker.
+  33-keypoint body pose *plus* 21 landmarks per hand (fingers included).
 
 ## Setup
 
@@ -11,9 +16,10 @@ can pick them up.
 pip install -r requirements.txt
 ```
 
-Model weights (`yolo11n-pose.pt`) download automatically on first run.
+`pose_demo.py`'s weights (`yolo11n-pose.pt`) and `mediapipe_pose_demo.py`'s
+models (`models/*.task`) download automatically on first run.
 
-## Run the demo
+## Run the YOLO demo (body only, fast)
 
 ```bash
 python pose_demo.py
@@ -35,7 +41,22 @@ python pose_demo.py --stdout --no-display | python examples/example_consumer.py
 `--device` defaults to `cpu`. Ultralytics has a known MPS bug for pose
 models on Apple Silicon GPUs, so `mps` is opt-in via `--device mps`.
 
-## Pose signal format
+## Run the MediaPipe demo (body + hands)
+
+```bash
+python mediapipe_pose_demo.py
+```
+
+Same behavior as `pose_demo.py` -- live preview, `q`/`Esc` to quit, writes
+`pose_stream.jsonl` -- but also draws and streams hand/finger landmarks.
+
+```bash
+python mediapipe_pose_demo.py --source video.mp4 --out out.jsonl
+python mediapipe_pose_demo.py --num-poses 2 --num-hands 4   # track 2 people
+python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
+```
+
+## Pose signal format (`pose_demo.py`)
 
 Each line of the output file is one JSON object:
 
@@ -55,3 +76,21 @@ run with `--track`, otherwise a per-frame detection index.
 
 See [`examples/example_consumer.py`](examples/example_consumer.py) for a
 minimal reader that consumes the stream from a file or via stdin.
+
+## Pose signal format (`mediapipe_pose_demo.py`)
+
+```json
+{"frame": 12, "t": 1699999999.1234,
+ "poses": [{"id": 0, "landmarks": {"nose": [x, y, z, visibility], "left_shoulder": [x, y, z, visibility], ...}}],
+ "hands": [{"handedness": "Left", "score": 0.95, "landmarks": {"wrist": [x, y, z], "thumb_tip": [x, y, z], ...}}]}
+```
+
+`poses[].landmarks` has all 33 BlazePose body points, each
+`[x_pixels, y_pixels, z_relative, visibility]`. `hands[].landmarks` has all
+21 hand points, each `[x_pixels, y_pixels, z_relative]`. `z` is relative
+depth (roughly hip-depth-normalized, not metric), not directly comparable to
+YOLO's pixel-space output. `handedness` is from the subject's own
+perspective (mirrored relative to the camera), and hands are **not** linked
+to a specific `poses[].id` -- matching a hand to a body is left to the
+consumer if needed. `id` is a per-frame list index, not a stable track ID
+across frames.
