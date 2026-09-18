@@ -106,15 +106,23 @@ def analyze_video_mediapipe(
     pose_model = mpd.ensure_model(mpd.MODELS_DIR / "pose_landmarker_lite.task", mpd.POSE_MODEL_URL)
     hand_model = mpd.ensure_model(mpd.MODELS_DIR / "hand_landmarker.task", mpd.HAND_MODEL_URL)
 
+    # IMAGE mode, not VIDEO: MediaPipe's VIDEO/LIVE_STREAM running mode caps
+    # PoseLandmarker at 1 detected person regardless of num_poses (tested
+    # against mediapipe==0.10.31) -- its cross-frame tracking optimization
+    # only carries forward a single person's ROI. Since we're processing a
+    # pre-recorded file frame-by-frame anyway (not a live stream), running
+    # each frame as an independent IMAGE detection sidesteps that and
+    # correctly finds all people, at the cost of the temporal smoothing
+    # VIDEO mode would otherwise provide.
     pose_landmarker = mpd.PoseLandmarker.create_from_options(mpd.PoseLandmarkerOptions(
         base_options=mpd.BaseOptions(model_asset_path=str(pose_model)),
-        running_mode=mpd.RunningMode.VIDEO,
+        running_mode=mpd.RunningMode.IMAGE,
         num_poses=num_poses,
         min_pose_detection_confidence=min_conf,
     ))
     hand_landmarker = mpd.HandLandmarker.create_from_options(mpd.HandLandmarkerOptions(
         base_options=mpd.BaseOptions(model_asset_path=str(hand_model)),
-        running_mode=mpd.RunningMode.VIDEO,
+        running_mode=mpd.RunningMode.IMAGE,
         num_hands=num_hands,
         min_hand_detection_confidence=min_conf,
     ))
@@ -143,10 +151,9 @@ def analyze_video_mediapipe(
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mpd.mp.Image(image_format=mpd.mp.ImageFormat.SRGB, data=rgb)
-                timestamp_ms = int(frame_idx / fps * 1000)
 
-                pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-                hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+                pose_result = pose_landmarker.detect(mp_image)
+                hand_result = hand_landmarker.detect(mp_image)
 
                 record = {
                     "frame": frame_idx,

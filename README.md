@@ -39,11 +39,14 @@ python app.py
 ```
 
 Opens a local Gradio app at http://127.0.0.1:7860. Upload a video, pick YOLO
-(fast, body only) or MediaPipe (body + hands), click Analyze. Each run writes
-to `runs/<timestamp>/`: `overlay.mp4` (annotated video) and `tracking.jsonl`
-(one JSON record per frame -- same formats documented below, except `t` is
-seconds into the video, i.e. `frame / fps`, not wall-clock time, since this
-is for analyzing a recorded clip rather than a live feed).
+(fast, body only) or MediaPipe (body + hands), click Analyze. For MediaPipe,
+set "Number of people in video" to at least how many dancers are in frame --
+it defaults to 4; YOLO has no such cap and detects everyone above the
+confidence threshold automatically. Each run writes to `runs/<timestamp>/`:
+`overlay.mp4` (annotated video) and `tracking.jsonl` (one JSON record per
+frame -- same formats documented below, except `t` is seconds into the
+video, i.e. `frame / fps`, not wall-clock time, since this is for analyzing
+a recorded clip rather than a live feed).
 
 `video_pipeline.py` has the underlying `analyze_video_yolo()` and
 `analyze_video_mediapipe()` functions if you want to call them directly from
@@ -85,6 +88,16 @@ python mediapipe_pose_demo.py --source video.mp4 --out out.jsonl
 python mediapipe_pose_demo.py --num-poses 2 --num-hands 4   # track 2 people
 python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
 ```
+
+**Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
+live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode
+caps at 1 detected person regardless of `--num-poses` (its cross-frame
+tracking only follows a single ROI; tested against `mediapipe==0.10.31`).
+`video_pipeline.py`/`app.py` avoid this by running each frame as an
+independent `IMAGE`-mode detection instead, since they don't need live
+temporal tracking. If reliable multi-person live tracking turns out to
+matter, switching this script to the same `IMAGE`-mode-per-frame approach is
+the fix -- at the cost of the smoothing `VIDEO` mode provides.
 
 ## Pose signal format (`pose_demo.py`)
 

@@ -20,7 +20,8 @@ from video_pipeline import analyze_video_mediapipe, analyze_video_yolo
 RUNS_DIR = Path(__file__).parent / "runs"
 
 
-def run_analysis(video_path: str, model_choice: str, track: bool, progress=gr.Progress()):
+def run_analysis(video_path: str, model_choice: str, track: bool, num_people: int,
+                  progress=gr.Progress()):
     if not video_path:
         raise gr.Error("Upload a video first.")
 
@@ -34,7 +35,10 @@ def run_analysis(video_path: str, model_choice: str, track: bool, progress=gr.Pr
     if model_choice == "YOLO (body only, fast)":
         summary = analyze_video_yolo(video_path, str(out_jsonl), str(out_video), track=track)
     else:
-        summary = analyze_video_mediapipe(video_path, str(out_jsonl), str(out_video))
+        summary = analyze_video_mediapipe(
+            video_path, str(out_jsonl), str(out_video),
+            num_poses=num_people, num_hands=num_people * 2,
+        )
 
     progress(1.0, desc="Done")
     summary_text = "\n".join(f"{k}: {v}" for k, v in summary.items())
@@ -58,6 +62,10 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
                 value=True, label="Persistent per-person IDs (YOLO ByteTrack)",
                 visible=True,
             )
+            num_people = gr.Slider(
+                minimum=1, maximum=12, step=1, value=4, visible=False,
+                label="Number of people in video (MediaPipe only -- YOLO has no cap)",
+            )
             run_btn = gr.Button("Analyze", variant="primary")
         with gr.Column():
             video_out = gr.Video(label="Overlay video")
@@ -65,12 +73,13 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
             summary_out = gr.Textbox(label="Summary", lines=4)
 
     model_choice.change(
-        lambda choice: gr.update(visible=choice.startswith("YOLO")),
-        inputs=model_choice, outputs=track,
+        lambda choice: (gr.update(visible=choice.startswith("YOLO")),
+                        gr.update(visible=choice.startswith("MediaPipe"))),
+        inputs=model_choice, outputs=[track, num_people],
     )
     run_btn.click(
         run_analysis,
-        inputs=[video_in, model_choice, track],
+        inputs=[video_in, model_choice, track, num_people],
         outputs=[video_out, json_out, summary_out],
     )
 
