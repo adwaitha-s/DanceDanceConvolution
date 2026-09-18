@@ -5,21 +5,51 @@ an annotated preview, and stream per-frame keypoint signals as JSON Lines so
 a separate process (e.g. a model consuming pose-sequence windows) can pick
 them up. Two detectors are included:
 
-- **`pose_demo.py`** -- YOLO11 pose. Fast, 17-keypoint COCO body pose only
-  (no hands).
-- **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker.
-  33-keypoint body pose *plus* 21 landmarks per hand (fingers included).
+- **`app.py`** + **`video_pipeline.py`** -- the main workflow: a local web UI
+  to upload a video and get back an overlay video and a tracking JSONL. See
+  [Web UI](#web-ui-video-in-tracking-json--overlay-video-out) below.
+- **`pose_demo.py`** -- YOLO11 pose, live webcam demo. Fast, 17-keypoint COCO
+  body pose only (no hands).
+- **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker,
+  live webcam demo. 33-keypoint body pose *plus* 21 landmarks per hand
+  (fingers included).
 
 ## Setup
 
+Use a virtualenv for this project rather than your system/base Python --
+`mediapipe`, `gradio`, and friends pull in a lot of transitive dependencies
+that can clash with unrelated packages otherwise.
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`pose_demo.py`'s weights (`yolo11n-pose.pt`) and `mediapipe_pose_demo.py`'s
-models (`models/*.task`) download automatically on first run.
+`pose_demo.py`'s weights (`yolo11n-pose.pt`) and the MediaPipe models
+(`models/*.task`) download automatically on first run. `video_pipeline.py`'s
+overlay export uses `ffmpeg` if it's on your `PATH` (`brew install ffmpeg`)
+to produce a browser-playable H.264 file; without it, the overlay is still
+written but in a codec most browsers won't preview inline.
 
-## Run the YOLO demo (body only, fast)
+## Web UI (video in, tracking JSON + overlay video out)
+
+```bash
+python app.py
+```
+
+Opens a local Gradio app at http://127.0.0.1:7860. Upload a video, pick YOLO
+(fast, body only) or MediaPipe (body + hands), click Analyze. Each run writes
+to `runs/<timestamp>/`: `overlay.mp4` (annotated video) and `tracking.jsonl`
+(one JSON record per frame -- same formats documented below, except `t` is
+seconds into the video, i.e. `frame / fps`, not wall-clock time, since this
+is for analyzing a recorded clip rather than a live feed).
+
+`video_pipeline.py` has the underlying `analyze_video_yolo()` and
+`analyze_video_mediapipe()` functions if you want to call them directly from
+a script instead of the UI.
+
+## Run the YOLO demo (body only, fast, live webcam)
 
 ```bash
 python pose_demo.py
@@ -41,7 +71,7 @@ python pose_demo.py --stdout --no-display | python examples/example_consumer.py
 `--device` defaults to `cpu`. Ultralytics has a known MPS bug for pose
 models on Apple Silicon GPUs, so `mps` is opt-in via `--device mps`.
 
-## Run the MediaPipe demo (body + hands)
+## Run the MediaPipe demo (body + hands, live webcam)
 
 ```bash
 python mediapipe_pose_demo.py

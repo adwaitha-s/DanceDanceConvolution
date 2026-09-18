@@ -1,4 +1,9 @@
 ultralytics>=8.3
 opencv-python>=4.10
 torch>=2.2
-mediapipe>=0.10
+# Pinned: mediapipe>=1.0 hits a fatal "Check failed: service_ Service is
+# unavailable" (Metal/GPU service init) crash on Apple Silicon when running
+# PoseLandmarker + HandLandmarker together. 0.10.x is confirmed working.
+mediapipe==0.10.31
+lap>=0.5.12
+gradio>=6.0

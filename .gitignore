@@ -10,3 +10,6 @@ models/
 
 # Generated pose signal streams
 *.jsonl
+
+# Web UI output directory
+runs/
