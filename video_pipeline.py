@@ -23,6 +23,20 @@ import cv2
 import pose_demo
 import mediapipe_pose_demo as mpd
 
+# COCO-WholeBody keypoint layout (rtmlib's Wholebody): 0-16 body (COCO-17,
+# same order/names as pose_demo.py), 17-22 feet, 23-90 face (skipped here --
+# not needed for body/hand tracking and it would triple the JSONL size),
+# 91-111 left hand, 112-132 right hand (same 21-point order as
+# mediapipe_pose_demo.HAND_LANDMARK_NAMES).
+RTMW_FOOT_NAMES = [
+    "left_big_toe", "left_small_toe", "left_heel",
+    "right_big_toe", "right_small_toe", "right_heel",
+]
+RTMW_BODY_SLICE = slice(0, 17)
+RTMW_FOOT_SLICE = slice(17, 23)
+RTMW_LEFT_HAND_SLICE = slice(91, 112)
+RTMW_RIGHT_HAND_SLICE = slice(112, 133)
+
 
 def _reencode_h264(raw_path: Path, final_path: Path) -> Path:
     """Re-encode to H.264/yuv420p with ffmpeg so browsers can play it inline.
@@ -179,6 +193,114 @@ def analyze_video_mediapipe(
         writer.release()
         pose_landmarker.close()
         hand_landmarker.close()
+
+    _reencode_h264(raw_video, out_video)
+    return {
+        "frames": frame_idx, "fps": round(fps, 2),
+        "max_people_detected": max_people, "max_hands_detected": max_hands,
+    }
+
+
+def _rtmw_person_to_record(person_id: int, bbox, keypoints, scores, conf_thr: float) -> dict:
+    def kp_dict(names, kp_slice):
+        pts = keypoints[kp_slice]
+        scs = scores[kp_slice]
+        return {
+            name: [round(float(x), 1), round(float(y), 1), round(float(s), 3)]
+            for name, (x, y), s in zip(names, pts, scs)
+        }
+
+    entry = {
+        "id": person_id,
+        "bbox": [round(float(v), 1) for v in bbox],
+        "conf": round(float(scores[RTMW_BODY_SLICE].mean()), 3),
+        "keypoints": kp_dict(pose_demo.KEYPOINT_NAMES, RTMW_BODY_SLICE),
+    }
+    entry["keypoints"].update(kp_dict(RTMW_FOOT_NAMES, RTMW_FOOT_SLICE))
+    # "left_hand_"/"right_hand_" prefix, not just "left_"/"right_" -- the
+    # hand's own wrist landmark would otherwise collide with the body's
+    # left_wrist/right_wrist key.
+    left_hand = kp_dict([f"left_hand_{n}" for n in mpd.HAND_LANDMARK_NAMES], RTMW_LEFT_HAND_SLICE)
+    right_hand = kp_dict([f"right_hand_{n}" for n in mpd.HAND_LANDMARK_NAMES], RTMW_RIGHT_HAND_SLICE)
+    if max((v[2] for v in left_hand.values()), default=0) >= conf_thr:
+        entry["keypoints"].update(left_hand)
+    if max((v[2] for v in right_hand.values()), default=0) >= conf_thr:
+        entry["keypoints"].update(right_hand)
+    return entry
+
+
+def analyze_video_rtmw(
+    video_path: str,
+    out_jsonl: str,
+    out_video: str,
+    mode: str = "lightweight",
+    hand_conf: float = 0.3,
+) -> dict:
+    """Run RTMW (RTMPose whole-body, via rtmlib) over every frame of video_path.
+
+    Unlike MediaPipe's separate body/hand models, RTMW is a single top-down
+    pipeline (person detector + per-person pose) so body and hand keypoints
+    come out already linked to the same person -- no post-hoc matching
+    needed, and no artificial cap on how many people it finds. `mode` is
+    "performance" (most accurate, slowest), "balanced", or "lightweight"
+    (fastest, default -- good enough accuracy for most footage and ~4x
+    faster on CPU).
+    """
+    from rtmlib import Wholebody, draw_skeleton
+
+    wholebody = Wholebody(mode=mode, backend="onnxruntime", device="cpu")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video {video_path!r}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    out_video = Path(out_video)
+    raw_video = out_video.with_suffix(".raw.mp4")
+    writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    frame_idx = 0
+    max_people = 0
+    max_hands = 0
+    try:
+        with open(out_jsonl, "w") as f:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                bboxes = wholebody.det_model(frame)
+                keypoints, scores = wholebody.pose_model(frame, bboxes=bboxes)
+
+                people = [
+                    _rtmw_person_to_record(i, bbox, kp, sc, hand_conf)
+                    for i, (bbox, kp, sc) in enumerate(zip(bboxes, keypoints, scores))
+                ]
+
+                record = {"frame": frame_idx, "t": round(frame_idx / fps, 4), "people": people}
+                f.write(json.dumps(record) + "\n")
+                max_people = max(max_people, len(people))
+                hands_this_frame = sum(
+                    ("left_hand_wrist" in p["keypoints"]) + ("right_hand_wrist" in p["keypoints"])
+                    for p in people
+                )
+                max_hands = max(max_hands, hands_this_frame)
+
+                if len(keypoints):
+                    # Draw only what's in the JSONL (body/feet/hands) -- zero
+                    # out the 68 face-keypoint scores rather than pull them
+                    # from the drawing library's own hardcoded point set.
+                    draw_scores = scores.copy()
+                    draw_scores[:, 23:91] = 0
+                    frame = draw_skeleton(frame, keypoints, draw_scores, kpt_thr=0.3)
+                writer.write(frame)
+                frame_idx += 1
+    finally:
+        cap.release()
+        writer.release()
 
     _reencode_h264(raw_video, out_video)
     return {

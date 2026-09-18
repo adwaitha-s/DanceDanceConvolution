@@ -7,3 +7,5 @@ torch>=2.2
 mediapipe==0.10.31
 lap>=0.5.12
 gradio>=6.0
+rtmlib>=0.0.13
+onnxruntime>=1.18

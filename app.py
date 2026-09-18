@@ -1,8 +1,8 @@
 """Local web UI: upload a video, get back tracking JSON + an overlay video.
 
-Wraps video_pipeline.py (YOLO or MediaPipe) in a small Gradio app for the
-video-analysis workflow -- upload a clip once, get the annotated video and
-the per-frame keypoint JSONL to feed into downstream processing.
+Wraps video_pipeline.py (YOLO, MediaPipe, or RTMW) in a small Gradio app for
+the video-analysis workflow -- upload a clip once, get the annotated video
+and the per-frame keypoint JSONL to feed into downstream processing.
 
 Usage:
     python app.py
@@ -15,7 +15,11 @@ from pathlib import Path
 
 import gradio as gr
 
-from video_pipeline import analyze_video_mediapipe, analyze_video_yolo
+from video_pipeline import analyze_video_mediapipe, analyze_video_rtmw, analyze_video_yolo
+
+MODEL_YOLO = "YOLO (body only, fast)"
+MODEL_MEDIAPIPE = "MediaPipe (body + hands, hands unreliable)"
+MODEL_RTMW = "RTMW (body + hands, multi-person, recommended)"
 
 RUNS_DIR = Path(__file__).parent / "runs"
 
@@ -32,8 +36,10 @@ def run_analysis(video_path: str, model_choice: str, track: bool, num_people: in
     out_video = run_dir / "overlay.mp4"
 
     progress(0.1, desc=f"Running {model_choice} pose detection...")
-    if model_choice == "YOLO (body only, fast)":
+    if model_choice == MODEL_YOLO:
         summary = analyze_video_yolo(video_path, str(out_jsonl), str(out_video), track=track)
+    elif model_choice == MODEL_RTMW:
+        summary = analyze_video_rtmw(video_path, str(out_jsonl), str(out_video))
     else:
         summary = analyze_video_mediapipe(
             video_path, str(out_jsonl), str(out_video),
@@ -55,8 +61,8 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
         with gr.Column():
             video_in = gr.Video(label="Input video")
             model_choice = gr.Radio(
-                ["YOLO (body only, fast)", "MediaPipe (body + hands)"],
-                value="YOLO (body only, fast)", label="Model",
+                [MODEL_YOLO, MODEL_RTMW, MODEL_MEDIAPIPE],
+                value=MODEL_YOLO, label="Model",
             )
             track = gr.Checkbox(
                 value=True, label="Persistent per-person IDs (YOLO ByteTrack)",
@@ -64,7 +70,7 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
             )
             num_people = gr.Slider(
                 minimum=1, maximum=12, step=1, value=4, visible=False,
-                label="Number of people in video (MediaPipe only -- YOLO has no cap)",
+                label="Number of people in video (MediaPipe only -- YOLO/RTMW have no cap)",
             )
             run_btn = gr.Button("Analyze", variant="primary")
         with gr.Column():
@@ -73,8 +79,8 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
             summary_out = gr.Textbox(label="Summary", lines=4)
 
     model_choice.change(
-        lambda choice: (gr.update(visible=choice.startswith("YOLO")),
-                        gr.update(visible=choice.startswith("MediaPipe"))),
+        lambda choice: (gr.update(visible=choice == MODEL_YOLO),
+                        gr.update(visible=choice == MODEL_MEDIAPIPE)),
         inputs=model_choice, outputs=[track, num_people],
     )
     run_btn.click(

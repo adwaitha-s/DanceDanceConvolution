@@ -3,7 +3,13 @@
 Pose-detection demos: run pose estimation on a webcam, video, or image, show
 an annotated preview, and stream per-frame keypoint signals as JSON Lines so
 a separate process (e.g. a model consuming pose-sequence windows) can pick
-them up. Two detectors are included:
+them up. Three detectors are available in the web UI / `video_pipeline.py`:
+
+| | Multi-person | Hands | Notes |
+|---|---|---|---|
+| **YOLO** | Yes, no cap | No | Fastest. Measured 100% frame coverage on a 476-frame test clip. |
+| **RTMW** (recommended for hands) | Yes, no cap | Yes, linked to the right person | Slower than YOLO on CPU but far more reliable hands -- see below. |
+| **MediaPipe** | Capped, needs a slider | Yes, but unreliable | Hands not linked to a body. Measured only 15% frame coverage on hands (0% with both hands at once) on the same test clip -- see [Known limitations](#known-limitations). |
 
 - **`app.py`** + **`video_pipeline.py`** -- the main workflow: a local web UI
   to upload a video and get back an overlay video and a tracking JSONL. See
@@ -12,7 +18,7 @@ them up. Two detectors are included:
   body pose only (no hands).
 - **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker,
   live webcam demo. 33-keypoint body pose *plus* 21 landmarks per hand
-  (fingers included).
+  (fingers included), same hand-reliability caveat as above.
 
 ## Setup
 
@@ -38,19 +44,24 @@ written but in a codec most browsers won't preview inline.
 python app.py
 ```
 
-Opens a local Gradio app at http://127.0.0.1:7860. Upload a video, pick YOLO
-(fast, body only) or MediaPipe (body + hands), click Analyze. For MediaPipe,
-set "Number of people in video" to at least how many dancers are in frame --
-it defaults to 4; YOLO has no such cap and detects everyone above the
-confidence threshold automatically. Each run writes to `runs/<timestamp>/`:
-`overlay.mp4` (annotated video) and `tracking.jsonl` (one JSON record per
-frame -- same formats documented below, except `t` is seconds into the
-video, i.e. `frame / fps`, not wall-clock time, since this is for analyzing
-a recorded clip rather than a live feed).
+Opens a local Gradio app at http://127.0.0.1:7860. Upload a video, pick a
+model, click Analyze:
 
-`video_pipeline.py` has the underlying `analyze_video_yolo()` and
-`analyze_video_mediapipe()` functions if you want to call them directly from
-a script instead of the UI.
+- **YOLO** (body only, fast) -- no configuration needed.
+- **RTMW** (body + hands, multi-person) -- recommended when you need hands;
+  no configuration needed, no person-count cap.
+- **MediaPipe** (body + hands) -- set "Number of people in video" to at
+  least how many dancers are in frame (defaults to 4); expect hands to drop
+  out often (see the table above).
+
+Each run writes to `runs/<timestamp>/`: `overlay.mp4` (annotated video) and
+`tracking.jsonl` (one JSON record per frame -- formats documented below,
+`t` is seconds into the video, i.e. `frame / fps`, not wall-clock time,
+since this is for analyzing a recorded clip rather than a live feed).
+
+`video_pipeline.py` has the underlying `analyze_video_yolo()`,
+`analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
+to call them directly from a script instead of the UI.
 
 ## Run the YOLO demo (body only, fast, live webcam)
 
@@ -120,6 +131,34 @@ run with `--track`, otherwise a per-frame detection index.
 See [`examples/example_consumer.py`](examples/example_consumer.py) for a
 minimal reader that consumes the stream from a file or via stdin.
 
+## Pose signal format (`analyze_video_rtmw` / RTMW)
+
+Same `people` structure as above (and `examples/example_consumer.py` reads
+it unmodified), extended with feet and per-person-linked hands:
+
+```json
+{"frame": 12, "t": 0.4, "people": [
+  {"id": 0, "bbox": [x1, y1, x2, y2], "conf": 0.93,
+   "keypoints": {"nose": [x, y, conf], "left_shoulder": [x, y, conf], ...,
+                 "left_big_toe": [x, y, conf], ...,
+                 "left_hand_wrist": [x, y, conf], "left_hand_thumb_tip": [x, y, conf], ...,
+                 "right_hand_wrist": [x, y, conf], ...}}
+]}
+```
+
+`keypoints` has the same 17 COCO body points as `pose_demo.py`, plus 6 feet
+points (`left_big_toe`, `left_small_toe`, `left_heel`, and the `right_`
+equivalents), plus 21 `left_hand_*`/21 `right_hand_*` points (only included
+when that hand's detection confidence clears `hand_conf`, default 0.3) --
+all `[x_pixels, y_pixels, confidence]`. Unlike MediaPipe, hands are always
+keyed to the same person `id` they belong to. There's no cross-frame
+tracking (no `--track` equivalent), so `id` is a per-frame detection index,
+not a stable identity -- add a tracker (e.g. IoU or ByteTrack over the
+`bbox`es) if you need persistent per-dancer IDs across frames. `mode` can be
+`"performance"` (most accurate, slowest), `"balanced"`, or `"lightweight"`
+(default -- ~15 FPS on CPU in testing, ~4x faster than `"balanced"` with a
+modest accuracy cost).
+
 ## Pose signal format (`mediapipe_pose_demo.py`)
 
 ```json
@@ -137,3 +176,25 @@ perspective (mirrored relative to the camera), and hands are **not** linked
 to a specific `poses[].id` -- matching a hand to a body is left to the
 consumer if needed. `id` is a per-frame list index, not a stable track ID
 across frames.
+
+## Known limitations
+
+**MediaPipe's hand detection is unreliable on real footage.** Measured on a
+476-frame (~16s) single-dancer test clip processed through the web UI:
+
+| | YOLO (body) | MediaPipe (body) | MediaPipe (hands) |
+|---|---|---|---|
+| Frames with a detection | 476/476 (100%) | 469/476 (98.5%) | 73/476 (15.3%) |
+| Frames with both instances at once | -- | -- | 0/476 (0%) |
+| Longest dropout streak | -- | -- | 155 consecutive frames |
+
+MediaPipe's body pose is solid (comparable to YOLO), but `HandLandmarker`
+runs on the full downscaled frame, where a hand is a small, often
+motion-blurred region -- it drops out constantly and never picked up both
+hands simultaneously in this clip. This is why RTMW is the recommended
+choice when hand data matters: as a top-down pipeline (person detector, then
+pose *on a crop of that person*), it gives the hand detector far more
+effective resolution on the hand itself. If you need MediaPipe specifically
+(e.g. its face mesh), the fix would be to crop around each wrist (from body
+keypoints) before running `HandLandmarker`, rather than run it on the whole
+frame -- not currently implemented.
