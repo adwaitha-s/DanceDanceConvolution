@@ -61,12 +61,12 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
         with gr.Column():
             video_in = gr.Video(label="Input video")
             model_choice = gr.Radio(
-                [MODEL_YOLO, MODEL_RTMW, MODEL_MEDIAPIPE],
-                value=MODEL_YOLO, label="Model",
+                [MODEL_RTMW, MODEL_YOLO, MODEL_MEDIAPIPE],
+                value=MODEL_RTMW, label="Model",
             )
             track = gr.Checkbox(
                 value=True, label="Persistent per-person IDs (YOLO ByteTrack)",
-                visible=True,
+                visible=False,
             )
             num_people = gr.Slider(
                 minimum=1, maximum=12, step=1, value=4, visible=False,
