@@ -8,8 +8,8 @@ them up. Three detectors are available in the web UI / `video_pipeline.py`:
 | | Multi-person | Hands | Notes |
 |---|---|---|---|
 | **YOLO** | Yes, no cap | No | Fastest. Measured 100% frame coverage on a 476-frame test clip. |
-| **RTMW** (recommended for hands) | Yes, no cap | Yes, linked to the right person | Slower than YOLO on CPU but far more reliable hands -- see below. |
-| **MediaPipe** | Capped, needs a slider | Yes, but unreliable | Hands not linked to a body. Measured only 15% frame coverage on hands (0% with both hands at once) on the same test clip -- see [Known limitations](#known-limitations). |
+| **RTMW** (recommended for hands) | Yes, no cap | Yes, linked to the right person | Slower than YOLO on CPU. Measured 99.9% of person-detections had a hand, on a 2-dancer clip -- see [Known limitations](#known-limitations). |
+| **MediaPipe** | Capped, needs a slider | Yes, but unreliable | Hands not linked to a body. Measured only 15% frame coverage on hands (0% with both hands at once) on a 1-dancer clip -- see [Known limitations](#known-limitations). |
 
 - **`app.py`** + **`video_pipeline.py`** -- the main workflow: a local web UI
   to upload a video and get back an overlay video and a tracking JSONL. See
@@ -198,3 +198,19 @@ effective resolution on the hand itself. If you need MediaPipe specifically
 (e.g. its face mesh), the fix would be to crop around each wrist (from body
 keypoints) before running `HandLandmarker`, rather than run it on the whole
 frame -- not currently implemented.
+
+**RTMW confirmed reliable on a real 2-dancer clip.** Measured on a 786-frame
+test clip processed through the web UI:
+
+| | Result |
+|---|---|
+| Frames with >=1 person | 667/786 (84.9%) |
+| Person-instances with >=1 hand | 1340/1342 (99.9%) |
+| Person-instances with both hands | 1335/1342 (99.5%) |
+| Person-count distribution | 2 people: 659 frames, 3 people: 8 frames (brief false positive), 0 people: 119 frames |
+
+The 119 zero-person frames are all one contiguous block at the very end of
+the clip (frames 667-786) -- consistent with the dancers leaving frame
+before the clip ends, not a detection dropout. In every frame where a person
+*was* detected, hands came through essentially every time (99.9%), a sharp
+contrast with MediaPipe's 15.3% hand coverage on comparable footage above.
