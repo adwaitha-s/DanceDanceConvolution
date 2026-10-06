@@ -238,3 +238,59 @@ def test_analyze_run_rejects_stale_track_selection(tmp_path):
         analyze_run(run_dir, render=False, selected_tracks=[0, 5])
     with pytest.raises(ValueError, match="no dancers selected"):
         analyze_run(run_dir, render=False, selected_tracks=[])
+
+
+def test_source_video_persists_for_reuse_without_video_path(tmp_path):
+    """Uploading a source video once should let later Compare runs on the same
+    run reuse it (undimmed) without asking the user to re-upload it."""
+    from ddc.analyze import _find_saved_source, _pick_background
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"fake video bytes")
+
+    assert _find_saved_source(run_dir) is None
+    bg, dim = _pick_background(run_dir, str(src))
+    assert bg == run_dir / "source.mov"
+    assert bg.exists()
+    assert dim == 1.0
+
+    # A later call with no video_path reuses the saved copy, still undimmed.
+    bg2, dim2 = _pick_background(run_dir, None)
+    assert bg2 == run_dir / "source.mov"
+    assert dim2 == 1.0
+
+    # Re-uploading a video with a different extension replaces the saved copy.
+    src2 = tmp_path / "clip2.mp4"
+    src2.write_bytes(b"other bytes")
+    bg3, dim3 = _pick_background(run_dir, str(src2))
+    assert bg3 == run_dir / "source.mp4"
+    assert not (run_dir / "source.mov").exists()
+
+
+def test_pick_background_falls_back_to_dimmed_overlay(tmp_path):
+    """With no uploaded/saved source video, the run's own overlay.mp4 (which
+    already has a skeleton drawn on it) is used, dimmed so the new deviation
+    skeleton drawn on top of it stays legible."""
+    from ddc.analyze import _pick_background
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "overlay.mp4").write_bytes(b"fake overlay")
+
+    bg, dim = _pick_background(run_dir, None)
+    assert bg == run_dir / "overlay.mp4"
+    assert dim == 0.3
+
+
+def test_detect_tracks_persists_uploaded_source_video(tmp_path):
+    from ddc.analyze import detect_tracks
+
+    frames = [[place(base_pose(), 200, 300, 40)] for _ in range(20)]
+    run_dir = _write_jsonl_run(tmp_path, frames)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"fake video bytes")
+
+    detect_tracks(run_dir, str(src))
+    assert (run_dir / "source.mp4").exists()

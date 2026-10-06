@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,41 @@ class TrackInfo:
     t_start: float
     t_end: float
     thumbnail: np.ndarray   # RGB uint8 crop
+
+
+def _find_saved_source(run_dir: Path) -> Path | None:
+    """A previously `_save_source_video`-d upload for this run, if any."""
+    matches = sorted(run_dir.glob("source.*"))
+    return matches[0] if matches else None
+
+
+def _save_source_video(run_dir: Path, video_path) -> Path:
+    """Persist an uploaded source video into the run dir (as `source.<ext>`) so
+    later Compare runs on this run reuse it automatically -- an undimmed
+    background -- without asking the user to re-upload it every time.
+    """
+    video_path = Path(video_path)
+    dest = run_dir / f"source{video_path.suffix or '.mp4'}"
+    for old in run_dir.glob("source.*"):
+        if old != dest:
+            old.unlink()
+    if dest.resolve() != video_path.resolve():
+        shutil.copy2(video_path, dest)
+    return dest
+
+
+def _pick_background(run_dir: Path, video_path) -> tuple[Path | None, float]:
+    """(background_path, dim). A given/saved source video is used undimmed;
+    the run's own overlay.mp4 (which already has a skeleton drawn on it) is
+    used as a last-resort background, dimmed so the new deviation skeleton
+    drawn on top of it stays legible."""
+    if video_path:
+        return _save_source_video(run_dir, video_path), 1.0
+    saved = _find_saved_source(run_dir)
+    if saved is not None:
+        return saved, 1.0
+    overlay = run_dir / "overlay.mp4"
+    return (overlay, 0.3) if overlay.exists() else (None, 1.0)
 
 
 def _crop_thumbnail(cap: cv2.VideoCapture | None, frame_idx: int, bbox, pad: float = 0.3,
@@ -84,7 +120,7 @@ def detect_tracks(run_dir, video_path=None) -> list[TrackInfo]:
             if tid >= 0:
                 occurrences[tid].append((f, i))
 
-    bg_path = video_path or ((run_dir / "overlay.mp4") if (run_dir / "overlay.mp4").exists() else None)
+    bg_path, _ = _pick_background(run_dir, video_path)
     cap = cv2.VideoCapture(str(bg_path)) if bg_path else None
     tracks = []
     for tid, occ in enumerate(occurrences):
@@ -169,8 +205,7 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
                  csv_path=str(csv_path))
     if render:
         from .render import render_overlay
-        bg, dim = (video_path, 1.0) if video_path else (
-            (run_dir / "overlay.mp4", 0.3) if (run_dir / "overlay.mp4").exists() else (None, 1.0))
+        bg, dim = _pick_background(run_dir, video_path)
         res.overlay_path = render_overlay(dense, dev, origin, scale, rot, det.t,
                                           run_dir / "composite_overlay.mp4", bg, dim)
     return res
