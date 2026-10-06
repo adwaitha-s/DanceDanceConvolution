@@ -41,6 +41,23 @@ RTMW_LEFT_HAND_SLICE = slice(91, 112)
 RTMW_RIGHT_HAND_SLICE = slice(112, 133)
 
 
+def _best_device() -> str:
+    """'mps' on a Mac with PyTorch's Metal backend available, else 'cpu'.
+
+    Pose inference (RTMW/YOLO), not video encoding, is what pegs every core on
+    a fresh Analyze run -- both are CPU-only by default. ultralytics (YOLO)
+    doesn't fall back on its own if 'mps' isn't actually usable, so this is
+    checked once here rather than hardcoded; rtmlib's own device mapping for
+    RTMW already does its own equivalent check internally (see Wholebody(...)
+    below), so it doesn't need this helper.
+    """
+    try:
+        import torch
+        return "mps" if torch.backends.mps.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
 def _parse_rate(rate: str) -> float:
     num, _, den = rate.partition("/")
     return float(num) / float(den or 1) if float(den or 1) else 0.0
@@ -81,7 +98,7 @@ def _cfr_source(video_path: str):
         cfr_path = str(Path(tmp) / "cfr.mp4")
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path, "-an",
-             "-vf", f"fps={avg_str}", "-c:v", "libx264", "-crf", "12",
+             "-vf", f"fps={avg_str}", "-c:v", "libx264", "-crf", "23",
              "-preset", "veryfast", "-pix_fmt", "yuv420p", cfr_path],
             check=True,
         )
@@ -99,14 +116,19 @@ def _cfr_input(fn):
 def _reencode_h264(raw_path: Path, final_path: Path) -> Path:
     """Re-encode to H.264/yuv420p with ffmpeg so browsers can play it inline.
 
-    Falls back to the raw (mp4v) file if ffmpeg isn't available.
+    Falls back to the raw (mp4v) file if ffmpeg isn't available. `veryfast` was
+    picked over the (unset) libx264 default of `medium` because this re-encode
+    dominates render time for both the pose-tracking and composite overlays --
+    on a many-core machine `medium` can peg every core for a while, and this is
+    a preview/debug video rather than something delivered for distribution, so
+    the modest file-size increase is worth the large speedup.
     """
     if shutil.which("ffmpeg") is None:
         raw_path.replace(final_path)
         return final_path
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_path),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(final_path)],
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(final_path)],
         check=True,
     )
     raw_path.unlink()
@@ -119,12 +141,13 @@ def analyze_video_yolo(
     out_jsonl: str,
     out_video: str,
     model: str = "yolo11n-pose.pt",
-    device: str = "cpu",
+    device: str | None = None,
     conf: float = 0.5,
     imgsz: int = 640,
     track: bool = True,
 ) -> dict:
     """Run YOLO pose over every frame of video_path. Returns a summary dict."""
+    device = device or _best_device()
     yolo = pose_demo.YOLO(model)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -307,9 +330,32 @@ def analyze_video_rtmw(
     (fastest, default -- good enough accuracy for most footage and ~4x
     faster on CPU).
     """
-    from rtmlib import Wholebody, draw_skeleton
+    from rtmlib import RTMPose, Wholebody, draw_skeleton
 
+    # The detector (YOLOX) and pose net are built separately below because
+    # only one of them can safely run on CoreML. rtmlib maps device="mps" to
+    # onnxruntime's CoreMLExecutionProvider, which looks like it should work
+    # for both (this Mac has it, and rtmlib assigns most of each graph to it
+    # without error) -- but the detector crashes at actual inference time:
+    # CoreML infers a different output rank than the graph's static shape
+    # ("CoreML static output shape ... and inferred shape ... have different
+    # ranks"), a real onnxruntime/CoreML bug with that model's dynamic shapes,
+    # not something rtmlib falls back from gracefully. Verified by testing
+    # actual inference, not just session construction -- so the detector
+    # stays on CPU unconditionally.
+    #
+    # The pose net (RTMPose, called once per detected person -- the dominant
+    # per-frame cost once there's more than one dancer) has no such problem:
+    # verified both for correctness (on a real frame, CPU vs. CoreML keypoints
+    # matched to within ~1px, scores within ~0.002) and for speed (on a
+    # 3-person frame, 74ms/frame on CPU vs. 17ms/frame on CoreML). So it's
+    # the one part of RTMW that's safe and worth offloading.
     wholebody = Wholebody(mode=mode, backend="onnxruntime", device="cpu")
+    if _best_device() == "mps":
+        wholebody.pose_model = RTMPose(
+            Wholebody.MODE[mode]["pose"],
+            model_input_size=Wholebody.MODE[mode]["pose_input_size"],
+            to_openpose=False, backend="onnxruntime", device="mps")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
