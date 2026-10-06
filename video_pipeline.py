@@ -13,9 +13,12 @@ since that is what matters for post-hoc analysis of a recorded clip.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -38,6 +41,61 @@ RTMW_LEFT_HAND_SLICE = slice(91, 112)
 RTMW_RIGHT_HAND_SLICE = slice(112, 133)
 
 
+def _parse_rate(rate: str) -> float:
+    num, _, den = rate.partition("/")
+    return float(num) / float(den or 1) if float(den or 1) else 0.0
+
+
+@contextlib.contextmanager
+def _cfr_source(video_path: str):
+    """Yield a constant-frame-rate copy of video_path if it's variable-frame-rate.
+
+    OpenCV reads VFR frames back-to-back and reports a single guessed fps, so
+    writing the overlay at that fps makes playback speed drift against the
+    original wherever the source's real frame timing differed. Resampling to
+    CFR at the source's true average rate first (frames dup/dropped to match
+    real timestamps) keeps overlay timing, frame indices, and JSONL `t`
+    aligned with the source's real clock. No-op if ffmpeg/ffprobe are missing
+    or the source is already CFR.
+    """
+    if shutil.which("ffprobe") is None or shutil.which("ffmpeg") is None:
+        yield video_path
+        return
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+         "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    )
+    try:
+        r_rate, avg_rate = (_parse_rate(x) for x in probe.stdout.strip().split(","))
+    except ValueError:
+        yield video_path
+        return
+    if avg_rate <= 0 or abs(r_rate - avg_rate) / avg_rate < 0.01:
+        yield video_path
+        return
+
+    avg_str = probe.stdout.strip().split(",")[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        cfr_path = str(Path(tmp) / "cfr.mp4")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path, "-an",
+             "-vf", f"fps={avg_str}", "-c:v", "libx264", "-crf", "12",
+             "-preset", "veryfast", "-pix_fmt", "yuv420p", cfr_path],
+            check=True,
+        )
+        yield cfr_path
+
+
+def _cfr_input(fn):
+    @functools.wraps(fn)
+    def wrapper(video_path, *args, **kwargs):
+        with _cfr_source(video_path) as path:
+            return fn(path, *args, **kwargs)
+    return wrapper
+
+
 def _reencode_h264(raw_path: Path, final_path: Path) -> Path:
     """Re-encode to H.264/yuv420p with ffmpeg so browsers can play it inline.
 
@@ -55,6 +113,7 @@ def _reencode_h264(raw_path: Path, final_path: Path) -> Path:
     return final_path
 
 
+@_cfr_input
 def analyze_video_yolo(
     video_path: str,
     out_jsonl: str,
@@ -108,6 +167,7 @@ def analyze_video_yolo(
     return {"frames": frame_idx, "fps": round(fps, 2), "max_people_detected": max_people}
 
 
+@_cfr_input
 def analyze_video_mediapipe(
     video_path: str,
     out_jsonl: str,
@@ -229,6 +289,7 @@ def _rtmw_person_to_record(person_id: int, bbox, keypoints, scores, conf_thr: fl
     return entry
 
 
+@_cfr_input
 def analyze_video_rtmw(
     video_path: str,
     out_jsonl: str,
