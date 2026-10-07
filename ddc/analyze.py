@@ -17,6 +17,7 @@ import numpy as np
 from . import io as ddc_io
 from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
+from .reference import reference_from_solo, reference_from_track
 from .skeleton import BODY
 from .tracking import stabilize, to_dense
 
@@ -153,11 +154,45 @@ class Result:
     csv_path: str | None = None
 
 
+REFERENCE_MODES = ("composite", "dancer", "solo")
+
+
+def _ensure_solo_run(run_dir: Path, solo_video) -> Path:
+    """Pose-track the solo reference video into `<run_dir>/reference_solo/`, reusing
+    a previous result if the same file (name, size, mtime) was already analyzed."""
+    from video_pipeline import analyze_video_rtmw
+
+    solo_video = Path(solo_video)
+    if not solo_video.exists():
+        raise ValueError(f"solo reference video not found: {solo_video}")
+    out = run_dir / "reference_solo"
+    jsonl, stamp = out / "tracking.jsonl", out / "source.stamp"
+    st = solo_video.stat()
+    key = f"{solo_video.name}|{st.st_size}|{int(st.st_mtime)}"
+    if jsonl.exists() and stamp.exists() and stamp.read_text() == key:
+        return out
+    out.mkdir(parents=True, exist_ok=True)
+    stamp.unlink(missing_ok=True)
+    analyze_video_rtmw(str(solo_video), str(jsonl), str(out / "overlay.mp4"))
+    stamp.write_text(key)
+    return out
+
+
 def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
-                smooth=5, render=True, selected_tracks=None, on_progress=None) -> Result:
+                smooth=5, render=True, selected_tracks=None, on_progress=None,
+                reference_mode="composite", reference_dancer=None, solo_video=None,
+                solo_offset=0.0) -> Result:
     """`selected_tracks`: track ids (from `detect_tracks`) to keep as dancers; a
     bystander/audience member's track dropped here never reaches the composite
-    or any deviation score. None keeps every stabilized track (old behavior)."""
+    or any deviation score. None keeps every stabilized track (old behavior).
+
+    `reference_mode` picks what deviation is measured against: "composite" (default,
+    consensus of all dancers), "dancer" (`reference_dancer`, an index into the kept
+    dancers, is the target and isn't scored itself), or "solo" (`solo_video` is
+    pose-tracked and used as the target; `solo_offset` seconds into it lines up
+    with t=0 of this run)."""
+    if reference_mode not in REFERENCE_MODES:
+        raise ValueError(f"unknown reference_mode {reference_mode!r}")
     run_dir = Path(run_dir)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
@@ -176,11 +211,33 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
         dense = dense[:, sorted(selected_tracks)]
         n_tracks = len(selected_tracks)
     norm, origin, scale, rot = normalize(dense, rotate=rotate)
-    dev = compute_deviation(norm, leave_one_out=leave_one_out, smooth=smooth)
+    reference = ref_track = None
+    if reference_mode == "dancer":
+        if n_tracks < 2:
+            raise ValueError("need at least 2 dancers to use one as the reference")
+        if reference_dancer is None or not 0 <= reference_dancer < n_tracks:
+            raise ValueError("pick which dancer is the reference")
+        ref_track = int(reference_dancer)
+        reference = reference_from_track(norm, ref_track, smooth)
+    elif reference_mode == "solo":
+        if not solo_video:
+            raise ValueError("upload a solo reference video")
+        reference = reference_from_solo(_ensure_solo_run(run_dir, solo_video), det.t,
+                                        solo_offset, rotate, smooth)
+        if not np.isfinite(reference[..., 0]).any():
+            raise ValueError("the solo reference video doesn't overlap this video's timeline "
+                             "-- check the offset")
+    dev = compute_deviation(norm, leave_one_out=leave_one_out, smooth=smooth,
+                            reference=reference, reference_track=ref_track)
 
     moments = worst_moments(dev, det.t)
     summary = []
     for d in range(n_tracks):
+        if d == ref_track:
+            summary.append({"dancer": f"Dancer {d + 1}", "frames_present": 0,
+                            "mean_dev": float("nan"), "worst_joint": "Reference",
+                            "worst_moments": []})
+            continue
         s = dev.score[:, d]
         mj = np.nanmean(dev.joint[:, d], axis=0)
         summary.append({
@@ -221,6 +278,13 @@ def main():
     ap.add_argument("--list-tracks", action="store_true",
                     help="list detected people (id, frames, time range) and exit")
     ap.add_argument("--tracks", help="comma-separated track ids to keep as dancers, e.g. 0,2")
+    ap.add_argument("--reference", choices=REFERENCE_MODES, default="composite",
+                    help="what to measure deviation against (default: composite of all dancers)")
+    ap.add_argument("--reference-dancer", type=int,
+                    help="with --reference dancer: 0-based index among the kept dancers")
+    ap.add_argument("--solo-video", help="with --reference solo: the solo reference video")
+    ap.add_argument("--solo-offset", type=float, default=0.0,
+                    help="seconds into the solo video that line up with t=0 of this run")
     a = ap.parse_args()
     if a.list_tracks:
         for tr in detect_tracks(a.run_dir, a.video):
@@ -228,8 +292,11 @@ def main():
         return
     selected = [int(x) for x in a.tracks.split(",")] if a.tracks else None
     r = analyze_run(a.run_dir, a.video, a.loo, a.rotate, render=not a.no_render,
-                    selected_tracks=selected)
-    print(f"{r.n_tracks} dancers, {len(r.t)} frames, leave_one_out={r.dev.leave_one_out}")
+                    selected_tracks=selected, reference_mode=a.reference,
+                    reference_dancer=a.reference_dancer, solo_video=a.solo_video,
+                    solo_offset=a.solo_offset)
+    print(f"{r.n_tracks} dancers, {len(r.t)} frames, reference={r.dev.mode}, "
+          f"leave_one_out={r.dev.leave_one_out}")
     for s in r.summary:
         print(s)
     print("csv:", r.csv_path, "\noverlay:", r.overlay_path)

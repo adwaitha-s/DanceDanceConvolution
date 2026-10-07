@@ -25,6 +25,11 @@ MODEL_YOLO = "YOLO (body only, fast)"
 MODEL_MEDIAPIPE = "MediaPipe (body + hands, hands unreliable)"
 MODEL_RTMW = "RTMW (body + hands, multi-person, recommended)"
 
+REF_COMPOSITE = "Composite of all dancers"
+REF_DANCER = "One of the dancers in this video"
+REF_SOLO = "Separate solo video"
+REF_MODES = {REF_COMPOSITE: "composite", REF_DANCER: "dancer", REF_SOLO: "solo"}
+
 RUNS_DIR = Path(__file__).parent / "runs"
 
 
@@ -83,11 +88,17 @@ def run_detect(run_name, source_video, progress=gr.Progress()):
     _LAST["track_labels"] = [tr.label for tr in tracks]
     gallery = [(tr.thumbnail, tr.label) for tr in tracks]
     choices = [tr.label for tr in tracks]
-    return gallery, gr.update(choices=choices, value=choices)
+    return gallery, gr.update(choices=choices, value=choices), gr.update(choices=choices, value=None)
+
+
+def update_ref_choices(track_choice, current):
+    """Reference-dancer dropdown offers only the people currently ticked as dancers."""
+    choices = list(track_choice or [])
+    return gr.update(choices=choices, value=current if current in choices else None)
 
 
 def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth,
-                progress=gr.Progress()):
+                ref_choice, ref_dancer, solo_video, solo_offset, progress=gr.Progress()):
     if not run_name:
         raise gr.Error("Pick a run first (run an analysis on the Pose tracking tab).")
     labels = _LAST.get("track_labels")
@@ -97,10 +108,21 @@ def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth
         raise gr.Error("Select at least one person as a dancer.")
     selected = [labels.index(c) for c in track_choice]
     loo = {"Auto (on for 3+ dancers)": None, "On": True, "Off": False}[loo_choice]
-    progress(0.1, desc="Building composite and deviation...")
+    mode = REF_MODES[ref_choice]
+    ref_idx = None
+    if mode == "dancer":
+        if ref_dancer not in track_choice:
+            raise gr.Error("Pick which dancer is the reference.")
+        ref_idx = sorted(selected).index(labels.index(ref_dancer))
+    elif mode == "solo" and not solo_video:
+        raise gr.Error("Upload a solo reference video.")
+    progress(0.1, desc="Analyzing solo reference video..." if mode == "solo"
+             else "Building reference and deviation...")
     try:
         res = analyze_run(RUNS_DIR / run_name, source_video, leave_one_out=loo,
-                          rotate=rotate, smooth=int(smooth), selected_tracks=selected)
+                          rotate=rotate, smooth=int(smooth), selected_tracks=selected,
+                          reference_mode=mode, reference_dancer=ref_idx,
+                          solo_video=solo_video, solo_offset=float(solo_offset or 0))
     except ValueError as e:
         raise gr.Error(str(e))
     _LAST["res"] = res
@@ -108,7 +130,7 @@ def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth
     rows = [[s["dancer"], s["frames_present"], round(s["mean_dev"], 3), s["worst_joint"],
              "; ".join(f"{t}s ({j})" for t, _, j in s["worst_moments"])] for s in res.summary]
     note = ""
-    if res.n_tracks == 2:
+    if res.n_tracks == 2 and mode == "composite":
         note = ("Only 2 dancers: the composite is their midpoint, so deviation is symmetric "
                 "(it measures how far apart they are, not who is off).")
     max_t = float(res.t[-1])
@@ -123,6 +145,9 @@ def frame_detail(t_sec):
     f = int(np.argmin(np.abs(res.t - t_sec)))
     lines = [f"t={res.t[f]:.2f}s (frame {f}), {int(res.dev.n_present[f])} dancer(s) present"]
     for d in range(res.n_tracks):
+        if d == res.dev.reference_track:
+            lines.append(f"Dancer {d + 1}: reference")
+            continue
         j = res.dev.joint[f, d]
         if not np.isfinite(j).any():
             lines.append(f"Dancer {d + 1}: not visible")
@@ -176,9 +201,10 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
         with gr.Tab("Compare"):
             gr.Markdown(
                 "# Composite pose and deviation\n"
-                "Builds a per-frame consensus pose from all dancers, then shows how far "
-                "each dancer is from it. Skeleton colour: green = close, red = far "
-                "(distance in torso lengths). White ghost = composite."
+                "Measures how far each dancer is from a reference pose, frame by frame: a "
+                "consensus of all dancers, one chosen dancer, or a separate solo video. "
+                "Skeleton colour: green = close, red = far (distance in torso lengths). "
+                "White ghost = reference."
             )
             with gr.Row():
                 with gr.Column(scale=1):
@@ -199,6 +225,16 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
                                                 object_fit="contain")
                     track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
 
+                    ref_choice = gr.Radio([REF_COMPOSITE, REF_DANCER, REF_SOLO], value=REF_COMPOSITE,
+                                          label="Deviation reference")
+                    ref_dancer = gr.Dropdown(
+                        [], value=None, visible=False,
+                        label="Reference dancer (everyone else is scored against this person)")
+                    solo_video = gr.Video(label="Solo reference video", visible=False)
+                    solo_offset = gr.Number(
+                        value=0, visible=False,
+                        label="Solo offset (s): seconds into the solo video that line up with the "
+                              "start of the group video (negative = solo starts later)")
                     loo_choice = gr.Radio(["Auto (on for 3+ dancers)", "On", "Off"],
                                           value="Auto (on for 3+ dancers)",
                                           label="Leave-one-out composite")
@@ -221,9 +257,16 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
 
             refresh_btn.click(lambda: gr.update(choices=list_runs()), outputs=run_dd)
             detect_btn.click(run_detect, inputs=[run_dd, src_video],
-                             outputs=[people_gallery, track_select])
+                             outputs=[people_gallery, track_select, ref_dancer])
+            track_select.change(update_ref_choices, inputs=[track_select, ref_dancer],
+                                outputs=ref_dancer)
+            ref_choice.change(
+                lambda c: (gr.update(visible=c == REF_DANCER), gr.update(visible=c == REF_SOLO),
+                           gr.update(visible=c == REF_SOLO), gr.update(visible=c == REF_COMPOSITE)),
+                inputs=ref_choice, outputs=[ref_dancer, solo_video, solo_offset, loo_choice])
             cmp_btn.click(run_compare,
-                          inputs=[run_dd, src_video, track_select, loo_choice, rotate, smooth],
+                          inputs=[run_dd, src_video, track_select, loo_choice, rotate, smooth,
+                                  ref_choice, ref_dancer, solo_video, solo_offset],
                           outputs=[cmp_video, timeline, summary_tbl, cmp_note, csv_out, t_slider])
             t_slider.change(frame_detail, inputs=t_slider, outputs=detail)
 

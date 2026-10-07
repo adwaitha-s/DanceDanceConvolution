@@ -63,6 +63,21 @@ since this is for analyzing a recorded clip rather than a live feed).
 `analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
 to call them directly from a script instead of the UI.
 
+### Deviation reference (Compare tab)
+
+The Compare tab scores each dancer's deviation against a reference pose. Pick one
+under "Deviation reference":
+
+- **Composite of all dancers** (default) -- per-frame consensus of everyone kept.
+- **One of the dancers in this video** -- choose a dancer; everyone else is scored
+  against that dancer. The reference dancer is drawn in white as `REF` and isn't scored.
+- **Separate solo video** -- upload a solo clip (pose-tracked with RTMW, cached in
+  `runs/<ts>/reference_solo/`). Both videos are assumed to start together; use
+  "Solo offset (s)" to shift the solo's timeline if they don't.
+
+CLI equivalents: `python -m ddc.analyze runs/<ts> --reference dancer --reference-dancer 0`
+or `--reference solo --solo-video solo.mp4 --solo-offset 0.5`.
+
 ## Run the YOLO demo (body only, fast, live webcam)
 
 ```bash

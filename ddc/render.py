@@ -77,10 +77,23 @@ def render_overlay(dense, dev, origin, scale, rot, t, out_path, video_path=None,
                 if not np.isfinite(dense[f, d, :, 0]).any() or not np.isfinite(origin[f, d]).all() \
                         or not np.isfinite(scale[f, d]):
                     continue
-                ref = dev.composite[f, d] if dev.leave_one_out else dev.composite[f]
-                ghost = denormalize(ref, origin[f, d], scale[f, d], rot[f, d])
                 pts = dense[f, d, :, :2]
                 ok = dense[f, d, :, 2] >= CONF_THR
+                if d == dev.reference_track:
+                    # The reference dancer is the target, not scored: plain white skeleton.
+                    for a, b in EDGE_IDX:
+                        if ok[a] and ok[b]:
+                            cv2.line(canvas, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)),
+                                     (255, 255, 255), thick + 1, cv2.LINE_AA)
+                    head = pts[ok][:, :2]
+                    if len(head):
+                        top = head[np.argmin(head[:, 1])].astype(int)
+                        cv2.putText(canvas, f"D{d + 1} REF", (int(top[0]) - 20, max(int(top[1]) - 16, 16)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, max(0.5, h / 1400), (255, 255, 255),
+                                    2, cv2.LINE_AA)
+                    continue
+                ref = dev.composite[f, d] if dev.leave_one_out else dev.composite[f]
+                ghost = denormalize(ref, origin[f, d], scale[f, d], rot[f, d])
                 # composite ghost (behind)
                 for a, b in EDGE_IDX:
                     if np.isfinite(ghost[[a, b]]).all():

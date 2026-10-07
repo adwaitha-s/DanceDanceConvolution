@@ -24,11 +24,14 @@ def _smooth(x: np.ndarray, win: int = 9) -> np.ndarray:
 
 def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
     T = dev.score.shape[1]
+    source = {"composite": "composite", "solo": "solo reference",
+              "dancer": f"Dancer {(dev.reference_track or 0) + 1} (reference)"}[dev.mode]
+    scored = [d for d in range(T) if d != dev.reference_track]
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.08,
-        subplot_titles=("Deviation from composite (torso lengths)", "Deviation by body group"),
+        subplot_titles=(f"Deviation from {source} (torso lengths)", "Deviation by body group"),
     )
-    for d in range(T):
+    for d in scored:
         fig.add_trace(go.Scatter(
             x=t.tolist(), y=[None if not np.isfinite(v) else round(float(v), 4) for v in _smooth(dev.score[:, d])], mode="lines", name=f"Dancer {d + 1}",
             line=dict(color=COLORS[d % len(COLORS)], width=2), connectgaps=False,
@@ -36,7 +39,7 @@ def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
             row=1, col=1)
 
     labels, rows = [], []
-    for d in range(T):
+    for d in scored:
         for g, v in dev.group.items():
             labels.append(f"D{d + 1} {g}")
             rows.append(_smooth(v[:, d]))
@@ -47,8 +50,11 @@ def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
         colorbar=dict(title="dev", len=0.45, y=0.2), hoverongaps=False,
         hovertemplate="t=%{x:.2f}s  %{y}: %{z:.2f}<extra></extra>"), row=2, col=1)
 
-    # Shade spans where the composite has < 2 contributors (deviation is uninformative).
-    low = dev.n_present < 2
+    # Shade spans where deviation is uninformative: the composite has < 2 contributors,
+    # or (dancer/solo reference) no one is being scored against the reference.
+    low = dev.n_present < (2 if dev.mode == "composite" else 1)
+    if dev.mode != "composite":
+        low = low | ~np.isfinite(dev.composite[:, :, 0]).any(-1)
     start = None
     for i, flag in enumerate(list(low) + [False]):
         if flag and start is None:
