@@ -100,6 +100,86 @@ python mediapipe_pose_demo.py --num-poses 2 --num-hands 4   # track 2 people
 python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
 ```
 
+## Evaluate dancer vs non-dancer pose features
+
+The detector deliberately labels every persistent person as a track; it does
+not infer whether somebody is dancing.  `ddc.dancer_features` collects five
+scale- and location-invariant track-level signals from a detector run:
+
+1. wrist height relative to the hips;
+2. wrist speed;
+3. limb extension (shoulder-to-wrist and hip-to-ankle reach);
+4. elbow/knee motion; and
+5. whole-pose motion.
+
+Create a small CSV which labels the tracks you have reviewed in a run:
+
+```csv
+track_id,label
+0,dancer
+1,dancer
+2,non_dancer
+3,non_dancer
+```
+
+Then run the evaluator (at least two tracks from each class are required):
+
+```bash
+python -m ddc.dancer_features runs/20261008-120000/tracking.jsonl labels.csv --out reports/my_run
+```
+
+It writes `track_features.csv`, `feature_selection_report.json`, and
+`feature_selection_accuracy.svg`.  The chart uses leave-one-track-out
+accuracy and compares each individual feature with three methods that select
+the best three features inside each validation fold: a **filter** (Fisher
+score), **wrapper** (greedy forward selection), and **embedded** (L1 logistic
+selection).  This prevents the accuracy graph from selecting features using
+the held-out track's label.
+
+For an end-to-end installation check only, use the synthetic example below.
+Its score is intentionally not a real-world model result.
+
+```bash
+python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
+```
+
+## Screen non-dancers before composite-pose analysis
+
+In the web UI, this screening now happens inside the **Compare** tab. Click
+**Find people** to score every saved track with the five standardized
+predictors displayed in `runs/dancer_feature_registry.xlsx`, generate a
+dancer-only pose overlay, and pre-select only the predicted dancers. It does
+**not** run pose detection again. The action also adds a Labels-style worksheet
+for the run. Use **Save reviewed labels** beside the checklist after changing
+the review: it updates Reviewed label, Validation status, and Correction
+recorded in that worksheet. Leaving the checklist unchanged and clicking
+**Compare** records the predictor labels as validated correct. Every saved
+review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
+the five predictors, followed by one labels sheet per run and one detailed
+sheet per validated dancer track.
+
+`ddc.dancer_screening` uses existing `tracking.jsonl` output; it does not run
+pose detection again.  It computes a 50-feature per-track table covering time,
+frequency, time-frequency, physical-motion, and non-demographic
+recording/visibility features.  An embedded L1-logistic model ranks them, then
+uses the three most influential features to write a dancers-only JSONL and
+overlay.  This stage belongs between detection and `analyze_run`, so a
+non-dancer never reaches the composite pose.
+
+```python
+from ddc.dancer_screening import screen_and_filter_run
+
+result = screen_and_filter_run(
+    "runs/my_run", "source.mp4", "labels.csv",
+    frame_width=1280, frame_height=720,
+)
+print(result["selected_features"])
+```
+
+The run directory will contain `feature_catalog.csv`,
+`extended_track_features.csv`, `embedded_feature_screening.json`,
+`tracking_dancers_only.jsonl`, and `dancers_only_overlay.mp4`.
+
 **Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
 live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode
 caps at 1 detected person regardless of `--num-poses` (its cross-frame
