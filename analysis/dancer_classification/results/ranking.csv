@@ -1,0 +1,17 @@
+,group,lasso_rank,coef_at_5_active,top5_stability,mean_dancer,mean_nondancer,single_feature_AUC
+leg_extension,domain,1,1.927,0.92,1.391,0.517,0.985
+knee_extension,domain,2,1.031,1.0,0.713,0.048,0.989
+arm_reach,domain,3,-0.434,0.84,0.829,1.133,0.923
+stft_flux,time-frequency,4,0.0,0.48,0.059,0.005,0.837
+stft_centroid_hz,time-frequency,5,0.249,0.7,1.751,1.326,0.843
+body_sway_std,time,6,-0.023,0.46,0.549,0.756,0.666
+ankle_speed_mean,time,7,0.0,0.13,2.92,1.297,0.79
+wrist_spec_entropy,frequency,8,0.0,0.07,0.859,0.875,0.534
+wrist_speed_mean,time,9,0.0,0.02,4.65,1.357,0.805
+wrist_height,domain,10,0.0,0.37,-0.578,-1.065,0.925
+wrist_dom_freq_hz,frequency,11,0.0,0.0,1.318,1.348,0.585
+wrist_jerk_rms,time,12,0.0,0.01,1966.065,1201.596,0.704
+travel_speed,domain,13,0.0,0.0,1.58,0.853,0.836
+lr_wrist_asym,domain,14,0.0,0.0,2.726,1.073,0.775
+beat_band_frac,frequency,15,0.0,0.0,0.353,0.225,0.701
+torso_lean_deg,domain,16,0.0,0.0,7.929,9.232,0.577

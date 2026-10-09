@@ -1,0 +1,28 @@
+Dancer vs non-dancer | 323 windows (173 dancer / 150 spectator), 3 dancers + 9 spectator tracks
+Method: embedded, L1-logistic (LASSO), features ranked by order of entry into the model
+Feature set: 16 pose-only features
+
+Top 5 features:
+  leg_extension      [domain] coef +1.93  stability 0.92  single-feature AUC 0.985  (dancer 1.391 vs spectator 0.517)
+  knee_extension     [domain] coef +1.03  stability 1.00  single-feature AUC 0.989  (dancer 0.713 vs spectator 0.048)
+  arm_reach          [domain] coef -0.43  stability 0.84  single-feature AUC 0.923  (dancer 0.829 vs spectator 1.133)
+  stft_flux          [time-frequency] coef +0.00  stability 0.48  single-feature AUC 0.837  (dancer 0.059 vs spectator 0.005)
+  stft_centroid_hz   [time-frequency] coef +0.25  stability 0.70  single-feature AUC 0.843  (dancer 1.751 vs spectator 1.326)
+
+Final set after dropping near-zero weights (|w| < 0.05): ['leg_extension', 'knee_extension', 'arm_reach', 'stft_centroid_hz']
+Nested score of that rule (top-5, drop ~0 weights, logistic; all redone inside each training fold):
+  unseen time blocks     AUC 0.979  acc 0.938  mean #features kept 4.2  survival: leg_extension 5, knee_extension 5, arm_reach 4, wrist_height 2, body_sway_std 2, stft_centroid_hz 2, stft_flux 1
+  unseen people          AUC 0.984  acc 0.985  mean #features kept 4.3  survival: leg_extension 3, knee_extension 3, arm_reach 3, stft_centroid_hz 2, wrist_height 1, stft_flux 1
+
+Out-of-fold score of the top-5 (selection redone inside each training fold):
+  unseen time blocks     logistic: acc 0.932  AUC 0.983   random forest: acc 0.981  AUC 0.976   | all 16 features, logistic: acc 0.892  AUC 0.983
+  unseen people          logistic: acc 0.985  AUC 0.985   random forest: acc 0.985  AUC 0.975   | all 16 features, logistic: acc 0.981  AUC 0.988
+
+Highly correlated pairs (|r| > 0.8) among the top-10:
+  arm_reach ~ wrist_height: r = -0.94
+  stft_flux ~ stft_centroid_hz: r = 0.92
+  leg_extension ~ knee_extension: r = 0.92
+  stft_flux ~ wrist_speed_mean: r = 0.88
+  stft_flux ~ wrist_height: r = 0.88
+  ankle_speed_mean ~ wrist_speed_mean: r = 0.82
+  stft_centroid_hz ~ wrist_height: r = 0.81
