@@ -278,3 +278,19 @@ def to_dense(kps: list, track_ids: list, n_tracks: int) -> np.ndarray:
             if tid >= 0:
                 dense[f, tid] = p
     return dense
+
+
+def stable_track_ids(det, merge_groups=None) -> tuple[list, int]:
+    """Final per-frame track ids for a loaded run: automatic stitching, then any manual merges.
+
+    This is the one place that defines "who is person N" for a run.  The Find people
+    list, the composite analysis and the dancer-filtering features must all use it, or
+    labels and predictions attach to different people than the ones on screen.
+    """
+    t = det.t
+    fps = float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
+    ids, n = stabilize(det.kps, fps=fps)
+    groups = [sorted(set(g)) for g in (merge_groups or []) if len(set(g)) > 1]
+    if groups:
+        ids, n = merge_track_ids(det.kps, ids, groups)
+    return ids, n
