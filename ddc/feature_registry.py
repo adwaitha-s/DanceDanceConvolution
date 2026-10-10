@@ -264,11 +264,12 @@ def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: 
 
 def rebuild_registry_workbook(runs_dir: str | Path) -> Path:
     """Rebuild ``dancer_feature_registry.xlsx`` from every validated run; never reruns detection."""
-    from .registry_workbook import write_registry_workbook
-
     runs_dir = Path(runs_dir)
     try:
+        from .registry_workbook import write_registry_workbook
         model = build_registry(runs_dir)
         return write_registry_workbook(model, runs_dir / "dancer_feature_registry.xlsx")
+    except ImportError as e:
+        raise RuntimeError(f"{e}; run `pip install -r requirements.txt`") from e
     except (ValueError, OSError) as e:
         raise RuntimeError(f"workbook builder failed: {e}") from e

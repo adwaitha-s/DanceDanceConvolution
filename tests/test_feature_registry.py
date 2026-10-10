@@ -103,3 +103,22 @@ def test_workbook_failure_is_a_runtime_error(tmp_path):
     _make_run(tmp_path, "only", labels=False)  # no labels anywhere -> cannot fit
     with pytest.raises(RuntimeError, match="workbook builder failed"):
         rebuild_registry_workbook(tmp_path)
+
+
+def test_missing_openpyxl_is_a_runtime_error(tmp_path, monkeypatch):
+    import builtins
+    import pytest
+    from ddc.feature_registry import rebuild_registry_workbook
+    _make_run(tmp_path, "training", labels=True)
+    _make_run(tmp_path, "candidate", labels=False)
+    real_import = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name == "openpyxl" or name.startswith("openpyxl."):
+            raise ImportError("No module named 'openpyxl'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+    monkeypatch.delitem(__import__("sys").modules, "ddc.registry_workbook", raising=False)
+    with pytest.raises(RuntimeError, match="pip install"):
+        rebuild_registry_workbook(tmp_path)
