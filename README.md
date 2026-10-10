@@ -163,28 +163,6 @@ camera-framing features (frame position, clip length, detected size) are never
 used as predictors. The Excel workbook (`runs/dancer_feature_registry.xlsx`) is written
 with `openpyxl`; if it cannot be built, the Compare tab still works and shows a note.
 
-`ddc.dancer_screening` uses existing `tracking.jsonl` output; it does not run
-pose detection again.  It computes a 50-feature per-track table covering time,
-frequency, time-frequency, physical-motion, and non-demographic
-recording/visibility features.  An embedded L1-logistic model ranks them, then
-uses the three most influential features to write a dancers-only JSONL and
-overlay.  This stage belongs between detection and `analyze_run`, so a
-non-dancer never reaches the composite pose.
-
-```python
-from ddc.dancer_screening import screen_and_filter_run
-
-result = screen_and_filter_run(
-    "runs/my_run", "source.mp4", "labels.csv",
-    frame_width=1280, frame_height=720,
-)
-print(result["selected_features"])
-```
-
-The run directory will contain `feature_catalog.csv`,
-`extended_track_features.csv`, `embedded_feature_screening.json`,
-`tracking_dancers_only.jsonl`, and `dancers_only_overlay.mp4`.
-
 **Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
 live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode
 caps at 1 detected person regardless of `--num-poses` (its cross-frame
