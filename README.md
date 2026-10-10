@@ -158,6 +158,11 @@ review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
 the five predictors, followed by one labels sheet per run and one detailed
 sheet per validated dancer track.
 
+Predictions for a run come from a model trained on *other* runs only, and
+camera-framing features (frame position, clip length, detected size) are never
+used as predictors. The Excel workbook (`runs/dancer_feature_registry.xlsx`) is written
+with `openpyxl`; if it cannot be built, the Compare tab still works and shows a note.
+
 `ddc.dancer_screening` uses existing `tracking.jsonl` output; it does not run
 pose detection again.  It computes a 50-feature per-track table covering time,
 frequency, time-frequency, physical-motion, and non-demographic

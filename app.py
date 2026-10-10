@@ -90,40 +90,49 @@ def run_detect(run_name, source_video, progress=gr.Progress()):
     try:
         progress(.55, desc="Scoring saved pose tracks from validated runs...")
         model, predictions = predict_run(RUNS_DIR, run_name)
-        prediction_map = {item["track_id"]: item for item in predictions}
-        selected = [tr.label for tr in tracks
-                    if prediction_map.get(tr.track_id, {}).get("predicted_label") == "dancer"]
-        # The predicted-dancer overlay stays in this tab.  It is generated from
-        # existing JSON poses; no detector call is made here.
-        rendered = render_classifier_overlay(RUNS_DIR / run_name, show_non_dancers=False,
-                                             video_path=source_video, predictions=predictions)
-        try:
-            # Add a Labels-style worksheet for this run immediately. Its local
-            # top-five weights populate once the checklist is validated.
-            rebuild_registry_workbook(RUNS_DIR)
-            workbook_status = " Registry workbook refreshed with this run's Labels sheet."
-        except RuntimeError as workbook_error:
-            workbook_status = f" Registry workbook refresh needs attention: {workbook_error}"
-        _LAST["predictions"] = predictions
-        _LAST["model"] = model
-        _LAST["predicted_selected_ids"] = frozenset(
-            tr.track_id for tr in tracks
-            if prediction_map.get(tr.track_id, {}).get("predicted_label") == "dancer")
-        weights = "; ".join(f"{item['feature_name']}: {item['standardized_coefficient']:+.3f}"
-                            for item in model["selected_features"])
-        note = (f"Automatic checklist: {len(selected)} predicted dancer(s). Top-five model has "
-                f"{model['labelled_tracks']} validated track labels across {len(model['runs'])} run(s). "
-                f"The checklist uses exactly these five standardized weights: {weights}. "
-                "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections." +
-                workbook_status)
-        progress(1, desc="Predicted dancer overlay ready")
-        return gallery, gr.update(choices=choices, value=selected), rendered["overlay"], note
     except ValueError as e:
         # A first-ever run cannot be predicted until both classes have two human
         # labels.  Keep the manual fallback explicit rather than silently training.
         _LAST["predictions"] = []
         return (gallery, gr.update(choices=choices, value=choices), None,
                 f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
+
+    prediction_map = {item["track_id"]: item for item in predictions}
+    predicted_ids = frozenset(tid for tid, item in prediction_map.items()
+                              if item["predicted_label"] == "dancer")
+    selected = [tr.label for tr in tracks if tr.track_id in predicted_ids]
+    _LAST["predictions"] = predictions
+    _LAST["model"] = model
+    _LAST["predicted_selected_ids"] = frozenset(
+        tr.track_id for tr in tracks if tr.track_id in predicted_ids)
+
+    # Overlay and workbook are conveniences: a failure in either must not discard
+    # the predictions above.  The overlay is built from existing JSON poses; no
+    # detector call is made here.
+    problems = []
+    overlay = None
+    try:
+        overlay = render_classifier_overlay(RUNS_DIR / run_name, show_non_dancers=False,
+                                            video_path=source_video, predictions=predictions)["overlay"]
+    except ValueError as e:
+        problems.append(f"Predicted-dancer overlay skipped: {e}.")
+    try:
+        # Add a Labels-style worksheet for this run immediately. Its local
+        # top-five weights populate once the checklist is validated.
+        rebuild_registry_workbook(RUNS_DIR)
+    except RuntimeError as e:
+        problems.append(f"Registry workbook refresh needs attention: {e}")
+
+    weights = "; ".join(f"{item['feature_name']}: {item['standardized_coefficient']:+.3f}"
+                        for item in model["selected_features"])
+    note = (f"Automatic checklist: {len(selected)} predicted dancer(s). Top-five model has "
+            f"{model['labelled_tracks']} validated track labels across {len(model['runs'])} run(s) "
+            f"(this run is held out of training). "
+            f"The checklist uses exactly these five standardized weights: {weights}. "
+            "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections. "
+            + " ".join(problems))
+    progress(1, desc="Predictions ready")
+    return gallery, gr.update(choices=choices, value=selected), overlay, note.strip()
 
 
 def save_review(run_name, track_choice, progress=gr.Progress()):

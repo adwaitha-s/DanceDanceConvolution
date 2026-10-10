@@ -52,3 +52,54 @@ def test_review_validation_records_corrections_and_preserves_original_prediction
     rebuilt = build_registry(tmp_path)
     candidate_detail = next(run for run in rebuilt["runs_detail"] if run["run"] == "candidate")
     assert {str(track["track_id"]): track["predicted_label"] for track in candidate_detail["tracks"]} == validation["predictor_labels"]
+
+
+def test_scored_run_is_held_out_of_training(tmp_path):
+    _make_run(tmp_path, "training", labels=True)
+    _make_run(tmp_path, "candidate", labels=True)  # already reviewed
+
+    model, _ = predict_run(tmp_path, "candidate")
+
+    assert model["held_out_run"] == "candidate"
+    assert model["runs"] == ["training"]
+
+
+def test_scoring_needs_labels_from_another_run(tmp_path):
+    import pytest
+    _make_run(tmp_path, "only", labels=True)
+    with pytest.raises(ValueError):
+        predict_run(tmp_path, "only")
+
+
+def test_camera_context_features_are_never_predictors(tmp_path):
+    from ddc.feature_inventory import ELIGIBLE_FEATURE_IDS
+    assert not [f for f in ELIGIBLE_FEATURE_IDS if f.startswith("context_")]
+    _make_run(tmp_path, "training", labels=True)
+    _make_run(tmp_path, "candidate", labels=False)
+    model, _ = predict_run(tmp_path, "candidate")
+    assert not [f for f in model["feature_ids"] if f.startswith("context_")]
+
+
+def test_workbook_is_written_with_summary_labels_and_dancer_sheets(tmp_path):
+    from openpyxl import load_workbook
+    from ddc.feature_registry import rebuild_registry_workbook
+    _make_run(tmp_path, "training", labels=True)
+    _make_run(tmp_path, "candidate", labels=False)
+
+    path = rebuild_registry_workbook(tmp_path)
+
+    wb = load_workbook(path)
+    assert wb.sheetnames[:3] == ["Registry Summary", "Feature Inventory Summary", "Feature Catalog"]
+    assert "Labels-training" in wb.sheetnames and "Labels-candidate" in wb.sheetnames
+    assert any(name.startswith("D1-training") for name in wb.sheetnames)
+    summary = wb["Registry Summary"]
+    assert [summary.cell(row=r, column=2).value for r in range(11, 16)]  # five predictors
+    assert wb["Labels-training"]["A5"].value == 0
+
+
+def test_workbook_failure_is_a_runtime_error(tmp_path):
+    import pytest
+    from ddc.feature_registry import rebuild_registry_workbook
+    _make_run(tmp_path, "only", labels=False)  # no labels anywhere -> cannot fit
+    with pytest.raises(RuntimeError, match="workbook builder failed"):
+        rebuild_registry_workbook(tmp_path)
