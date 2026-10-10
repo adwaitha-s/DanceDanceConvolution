@@ -39,9 +39,9 @@ class FeatureSpec:
 def _specs() -> list[FeatureSpec]:
     specs: list[FeatureSpec] = []
 
-    def add(ids, category, signal, unit="normalized units"):
+    def add(ids, category, signal, unit="normalized units", eligible=True):
         for ident, name, definition in ids:
-            specs.append(FeatureSpec(ident, category, name, definition, unit, signal, True))
+            specs.append(FeatureSpec(ident, category, name, definition, unit, signal, eligible))
 
     add([
         ("time_pose_motion_mean", "Mean pose motion", "Mean frame-to-frame all-joint speed."),
@@ -113,15 +113,17 @@ def _specs() -> list[FeatureSpec]:
         ("context_visible_frame_fraction", "Visible-frame fraction", "Share of clip frames containing the stabilized track."),
         ("context_mean_pose_confidence", "Mean pose confidence", "Mean detector confidence across visible body points."),
         ("context_median_person_height_px", "Median detected height", "Median pose bounding-box height."),
-    ], "Human and observation context", "tracking metadata", "seconds, fraction, confidence, or pixels")
+    ], "Human and observation context", "tracking metadata", "seconds, fraction, confidence, or pixels",
+        eligible=False)
     for ident, name, definition in [
         ("context_median_x_fraction", "Median horizontal location", "Median horizontal person location relative to frame width."),
         ("context_median_y_fraction", "Median vertical location", "Median vertical person location relative to frame height."),
         ("context_center_distance", "Median distance from frame centre", "Median normalized distance of the person from the frame centre."),
     ]:
         specs.append(FeatureSpec(ident, "Human and observation context", name, definition,
-                                 "frame fraction", "tracking metadata", True,
-                                 "Derived from pose overlay; inspect for possible framing bias"))
+                                 "frame fraction", "tracking metadata", False,
+                                 "Derived from pose overlay; excluded from predictors because it "
+                                 "encodes camera framing, not dancing"))
     for ident, name, definition in [
         ("human_role_annotation", "Reviewed dancer role", "Human-reviewed dancer/non-dancer label; target only."),
         ("human_age_group", "Voluntarily reported age group", "Requires consented participant data; not inferred from video."),
@@ -138,6 +140,9 @@ def _specs() -> list[FeatureSpec]:
 FEATURE_SPECS = _specs()
 SPEC_BY_ID = {spec.id: spec for spec in FEATURE_SPECS}
 DERIVED_FEATURE_IDS = [spec.id for spec in FEATURE_SPECS if spec.availability.startswith("Derived")]
+# Context features (clip length, frame position, detected size, confidence) describe
+# how the camera saw a person, not how they move.  With few labelled tracks they
+# are easy to overfit and do not transfer to a new clip, so they are never predictors.
 ELIGIBLE_FEATURE_IDS = [spec.id for spec in FEATURE_SPECS if spec.predictor_eligible]
 
 

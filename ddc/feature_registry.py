@@ -10,9 +10,6 @@ from __future__ import annotations
 import csv
 import json
 import math
-import os
-import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,9 +39,11 @@ def _load_run_rows(run_dir: Path) -> list[dict]:
     return collect_feature_inventory(run_dir / "tracking.jsonl")
 
 
-def _training_records(runs_dir: Path) -> list[dict]:
+def _training_records(runs_dir: Path, exclude_run: str | None = None) -> list[dict]:
     records = []
     for run_dir in _run_directories(runs_dir):
+        if run_dir.name == exclude_run:
+            continue
         label_path = run_dir / "labels.csv"
         if not label_path.exists():
             continue
@@ -210,20 +209,23 @@ def build_registry(runs_dir: str | Path, n_features: int = 5) -> dict:
         "from every validated track, so a run contributes its labels and feature values "
         "without giving a small run the same vote as a larger one."
     )
-    model["position_and_presence_weights"] = [
-        item for item in model["selected_features"]
-        if item["feature_id"] in {"context_frames_present", "context_median_x_fraction",
-                                   "context_median_y_fraction", "context_center_distance"}
-    ]
     (runs_dir / "feature_model_registry.json").write_text(json.dumps(model, indent=2), encoding="utf-8")
     (runs_dir / "feature_registry_workbook_payload.json").write_text(json.dumps(model, indent=2), encoding="utf-8")
     return model
 
 
 def predict_run(runs_dir: str | Path, run_name: str) -> tuple[dict, list[dict]]:
-    """Score all saved tracks in a run from prior validated statistics."""
-    model = build_registry(runs_dir)
-    run_dir = Path(runs_dir) / run_name
+    """Score all saved tracks in a run from *other* runs' validated statistics.
+
+    The run being scored is held out of training.  Otherwise a run that was
+    already reviewed would be scored by a model that has memorised its own
+    labels, and "validated correct" would be meaningless.  This is a read-only
+    fit; ``build_registry`` (which writes the workbook payload) is not called.
+    """
+    runs_dir = Path(runs_dir)
+    model = _fit_registry(_training_records(runs_dir, exclude_run=run_name))
+    model["held_out_run"] = run_name
+    run_dir = runs_dir / run_name
     return model, [_score_row(row, model) for row in _load_run_rows(run_dir)]
 
 
@@ -261,13 +263,13 @@ def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: 
 
 
 def rebuild_registry_workbook(runs_dir: str | Path) -> Path:
-    """Run the project workbook builder after validation; pose detection is never rerun."""
+    """Rebuild ``dancer_feature_registry.xlsx`` from every validated run; never reruns detection."""
     runs_dir = Path(runs_dir)
-    script = Path(__file__).resolve().parents[1] / "scripts" / "build_feature_registry.mjs"
-    bundled_node = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin" / "node.exe"
-    node_command = os.environ.get("DDC_ARTIFACT_NODE") or (str(bundled_node) if bundled_node.exists()
-                                                             else shutil.which("node") or "node")
-    result = subprocess.run([node_command, str(script), str(runs_dir)], capture_output=True, text=True)
-    if result.returncode:
-        raise RuntimeError(f"workbook builder failed: {result.stderr.strip() or result.stdout.strip()}")
-    return runs_dir / "dancer_feature_registry.xlsx"
+    try:
+        from .registry_workbook import write_registry_workbook
+        model = build_registry(runs_dir)
+        return write_registry_workbook(model, runs_dir / "dancer_feature_registry.xlsx")
+    except ImportError as e:
+        raise RuntimeError(f"{e}; run `pip install -r requirements.txt`") from e
+    except (ValueError, OSError) as e:
+        raise RuntimeError(f"workbook builder failed: {e}") from e
