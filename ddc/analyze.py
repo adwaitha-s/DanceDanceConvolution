@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -19,7 +19,7 @@ from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
 from .reference import reference_from_solo, reference_from_track
 from .skeleton import BODY
-from .tracking import stabilize, to_dense
+from .tracking import merge_track_ids, stabilize, to_dense
 
 
 @dataclass
@@ -38,6 +38,8 @@ class TrackInfo:
     t_start: float
     t_end: float
     thumbnail: np.ndarray   # RGB uint8 crop
+    segments: list = field(default_factory=list)   # [(t0, t1)] spans where the person is visible
+    fragments: int = 1      # automatic tracklets joined into this person
 
 
 def _find_saved_source(run_dir: Path) -> Path | None:
@@ -99,21 +101,46 @@ def _crop_thumbnail(cap: cv2.VideoCapture | None, frame_idx: int, bbox, pad: flo
     return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
 
-def detect_tracks(run_dir, video_path=None) -> list[TrackInfo]:
+def _fps(t: np.ndarray) -> float:
+    return float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
+
+
+def _apply_merges(kps, ids, fragments, merge_groups):
+    """Manual merges on top of the automatic stitching. Returns (ids, n, fragments per track)."""
+    if not merge_groups:
+        return ids, len(fragments), fragments
+    groups = [sorted(set(g)) for g in merge_groups if len(g) > 1]
+    ids, n = merge_track_ids(kps, ids, groups)
+    target = {t: t for t in range(len(fragments))}
+    for g in groups:
+        for t in g:
+            target[t] = g[0]
+    kept = sorted(set(target.values()))
+    merged = [sum(fragments[t] for t in target if target[t] == k) for k in kept]
+    return ids, n, merged
+
+
+def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo]:
     """Stabilize tracks and return one thumbnail + summary per track.
 
     Meant to run before `analyze_run`: show the result to the user so they can
     exclude anyone who isn't actually a dancer (`analyze_run`'s `selected_tracks`).
     Track ids are deterministic (same jsonl -> same `stabilize()` output), so ids
     collected here line up with the ones `analyze_run` will produce.
+
+    `merge_groups`: lists of automatic track ids to treat as one person (the
+    stitcher can miss a join); pass the same groups to `analyze_run`. Returned
+    ids/labels are then for the merged view.
     """
     run_dir = Path(run_dir)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks = stabilize(det.kps)
+    fps = _fps(det.t)
+    ids, n_tracks, info = stabilize(det.kps, fps=fps, return_info=True)
     if n_tracks == 0:
         raise ValueError("no persistent people found (all detections were short-lived)")
+    ids, n_tracks, fragments = _apply_merges(det.kps, ids, info["fragments"], merge_groups)
 
     occurrences: list[list[tuple[int, int]]] = [[] for _ in range(n_tracks)]
     for f, a in enumerate(ids):
@@ -129,9 +156,16 @@ def detect_tracks(run_dir, video_path=None) -> list[TrackInfo]:
         t_start, t_end = float(det.t[fs[0]]), float(det.t[fs[-1]])
         best_f, best_i = max(occ, key=lambda fi: det.raw[fi[0]][fi[1]].get("conf", 0.0))
         thumb = _crop_thumbnail(cap, best_f, det.raw[best_f][best_i].get("bbox"))
+        joined = f", {fragments[tid]} fragments joined" if fragments[tid] > 1 else ""
+        segments, s = [], 0
+        for k in range(1, len(fs) + 1):
+            if k == len(fs) or det.t[fs[k]] - det.t[fs[k - 1]] > 0.5:
+                segments.append((float(det.t[fs[s]]), float(det.t[fs[k - 1]])))
+                s = k
         tracks.append(TrackInfo(
             track_id=tid, frames_present=len(occ), t_start=t_start, t_end=t_end, thumbnail=thumb,
-            label=f"Person {tid + 1}  ({len(occ)} frames, {t_start:.1f}s–{t_end:.1f}s)",
+            segments=segments, fragments=fragments[tid],
+            label=f"Person {tid + 1}  ({len(occ)} frames, {t_start:.1f}s–{t_end:.1f}s{joined})",
         ))
     if cap is not None:
         cap.release()
@@ -181,7 +215,7 @@ def _ensure_solo_run(run_dir: Path, solo_video) -> Path:
 def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
                 smooth=5, render=True, selected_tracks=None, on_progress=None,
                 reference_mode="composite", reference_dancer=None, solo_video=None,
-                solo_offset=0.0) -> Result:
+                solo_offset=0.0, merge_groups=None) -> Result:
     """`selected_tracks`: track ids (from `detect_tracks`) to keep as dancers; a
     bystander/audience member's track dropped here never reaches the composite
     or any deviation score. None keeps every stabilized track (old behavior).
@@ -190,16 +224,21 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
     consensus of all dancers), "dancer" (`reference_dancer`, an index into the kept
     dancers, is the target and isn't scored itself), or "solo" (`solo_video` is
     pose-tracked and used as the target; `solo_offset` seconds into it lines up
-    with t=0 of this run)."""
+    with t=0 of this run).
+
+    `merge_groups`: groups of track ids (as numbered by `detect_tracks`) to merge
+    into one dancer before `selected_tracks` is applied."""
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"unknown reference_mode {reference_mode!r}")
     run_dir = Path(run_dir)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks = stabilize(det.kps)
+    ids, n_tracks = stabilize(det.kps, fps=_fps(det.t))
     if n_tracks == 0:
         raise ValueError("no persistent dancers found (all detections were short-lived)")
+    if merge_groups:
+        ids, n_tracks = merge_track_ids(det.kps, ids, merge_groups)
     dense = to_dense(det.kps, ids, n_tracks)
     if selected_tracks is not None:
         if not selected_tracks:
@@ -278,6 +317,9 @@ def main():
     ap.add_argument("--list-tracks", action="store_true",
                     help="list detected people (id, frames, time range) and exit")
     ap.add_argument("--tracks", help="comma-separated track ids to keep as dancers, e.g. 0,2")
+    ap.add_argument("--merge", action="append", metavar="IDS",
+                    help="comma-separated track ids (from --list-tracks) that are one person, "
+                         "e.g. --merge 2,5; repeat for several people")
     ap.add_argument("--reference", choices=REFERENCE_MODES, default="composite",
                     help="what to measure deviation against (default: composite of all dancers)")
     ap.add_argument("--reference-dancer", type=int,
@@ -286,15 +328,16 @@ def main():
     ap.add_argument("--solo-offset", type=float, default=0.0,
                     help="seconds into the solo video that line up with t=0 of this run")
     a = ap.parse_args()
+    merges = [[int(x) for x in m.split(",")] for m in a.merge] if a.merge else None
     if a.list_tracks:
-        for tr in detect_tracks(a.run_dir, a.video):
+        for tr in detect_tracks(a.run_dir, a.video, merges):
             print(f"{tr.track_id}: {tr.label}")
         return
     selected = [int(x) for x in a.tracks.split(",")] if a.tracks else None
     r = analyze_run(a.run_dir, a.video, a.loo, a.rotate, render=not a.no_render,
                     selected_tracks=selected, reference_mode=a.reference,
                     reference_dancer=a.reference_dancer, solo_video=a.solo_video,
-                    solo_offset=a.solo_offset)
+                    solo_offset=a.solo_offset, merge_groups=merges)
     print(f"{r.n_tracks} dancers, {len(r.t)} frames, reference={r.dev.mode}, "
           f"leave_one_out={r.dev.leave_one_out}")
     for s in r.summary:

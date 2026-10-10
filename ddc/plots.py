@@ -22,6 +22,31 @@ def _smooth(x: np.ndarray, win: int = 9) -> np.ndarray:
     return out
 
 
+def tracks_figure(tracks) -> go.Figure:
+    """Gantt of when each detected person is visible (gaps > 0.5 s break the bar).
+
+    `tracks`: `analyze.TrackInfo` list. Lets you see where fragments were joined
+    and which people overlap in time (overlapping people can't be the same one)."""
+    fig = go.Figure()
+    for k, tr in enumerate(tracks):
+        xs, ys = [], []
+        for t0, t1 in tr.segments:
+            xs += [t0, t1, None]
+            ys += [tr.track_id + 1] * 3
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=f"Person {tr.track_id + 1}", showlegend=False,
+            line=dict(color=COLORS[k % len(COLORS)], width=10), connectgaps=False,
+            hovertemplate=f"Person {tr.track_id + 1}: {tr.frames_present} frames, "
+                          f"{tr.fragments} fragment(s) joined<extra></extra>"))
+    n = max(len(tracks), 1)
+    fig.update_yaxes(autorange="reversed", dtick=1, title_text="person",
+                     range=[n + 0.5, 0.5])
+    fig.update_xaxes(title_text="time (s)")
+    fig.update_layout(height=max(160, 40 * n + 80), margin=dict(l=60, r=20, t=20, b=40),
+                      title=None)
+    return fig
+
+
 def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
     T = dev.score.shape[1]
     source = {"composite": "composite", "solo": "solo reference",

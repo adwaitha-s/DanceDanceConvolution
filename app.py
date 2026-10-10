@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import analyze_run, detect_tracks
-from ddc.plots import timeline_figure
+from ddc.plots import timeline_figure, tracks_figure
 from ddc.skeleton import BODY
 from video_pipeline import analyze_video_mediapipe, analyze_video_rtmw, analyze_video_yolo
 
@@ -70,25 +71,66 @@ def list_runs() -> list[str]:
 _LAST: dict = {}
 
 
+def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
+    """Automatic track ids behind each displayed person, in display order (matches the
+    renumbering in ddc.tracking.merge_track_ids: merged people sort by lowest member)."""
+    target = {t: t for t in range(n_auto)}
+    for g in groups:
+        for t in g:
+            target[t] = min(g)
+    return [[t for t in range(n_auto) if target[t] == k] for k in sorted(set(target.values()))]
+
+
+def _show_people(run_name, source_video, groups):
+    """(Re)render the people list for the current merges and remember it."""
+    try:
+        tracks = detect_tracks(RUNS_DIR / run_name, source_video, merge_groups=groups or None)
+    except ValueError as e:
+        raise gr.Error(str(e))
+    labels = [tr.label for tr in tracks]
+    _LAST["track_run"] = run_name
+    _LAST["track_labels"] = labels
+    _LAST["merges"] = groups
+    gallery = [(tr.thumbnail, tr.label) for tr in tracks]
+    return (gallery, gr.update(choices=labels, value=labels), gr.update(choices=labels, value=None),
+            gr.update(choices=labels, value=[]), tracks_figure(tracks))
+
+
 def run_detect(run_name, source_video, progress=gr.Progress()):
     """Step 1: find every stabilized person track in the run and show a thumbnail
     for each, so the user can rule out bystanders/audience before anything is
     scored -- the tracker has no notion of "dancer" vs. "person on camera",
-    it keeps anyone visible for more than ~15 frames.
+    it keeps anyone visible for more than ~15 frames. Fragments of one person
+    that the tracker lost and re-found are joined automatically; "Merge" below
+    fixes any it missed.
     """
     if not run_name:
         raise gr.Error("Pick a run first (run an analysis on the Pose tracking tab).")
     progress(0.3, desc="Finding people in the clip...")
-    try:
-        tracks = detect_tracks(RUNS_DIR / run_name, source_video)
-    except ValueError as e:
-        raise gr.Error(str(e))
     _LAST.clear()
-    _LAST["track_run"] = run_name
-    _LAST["track_labels"] = [tr.label for tr in tracks]
-    gallery = [(tr.thumbnail, tr.label) for tr in tracks]
-    choices = [tr.label for tr in tracks]
-    return gallery, gr.update(choices=choices, value=choices), gr.update(choices=choices, value=None)
+    out = _show_people(run_name, source_video, [])
+    _LAST["n_auto"] = len(out[0])
+    return out
+
+
+def run_merge(run_name, source_video, merge_choice):
+    """Treat the ticked people as one person (adds to any earlier merges)."""
+    labels = _LAST.get("track_labels")
+    if not labels or _LAST.get("track_run") != run_name:
+        raise gr.Error('Click "1. Find people" first.')
+    if len(merge_choice or []) < 2:
+        raise gr.Error("Tick at least two people to merge.")
+    members = _members(_LAST["n_auto"], _LAST.get("merges", []))
+    picked = sorted(labels.index(c) for c in merge_choice)
+    joined = sorted(t for i in picked for t in members[i])
+    groups = [m for i, m in enumerate(members) if len(m) > 1 and i not in picked] + [joined]
+    return _show_people(run_name, source_video, groups)
+
+
+def run_reset_merges(run_name, source_video):
+    if not _LAST.get("track_labels") or _LAST.get("track_run") != run_name:
+        raise gr.Error('Click "1. Find people" first.')
+    return _show_people(run_name, source_video, [])
 
 
 def update_ref_choices(track_choice, current):
@@ -122,7 +164,8 @@ def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth
         res = analyze_run(RUNS_DIR / run_name, source_video, leave_one_out=loo,
                           rotate=rotate, smooth=int(smooth), selected_tracks=selected,
                           reference_mode=mode, reference_dancer=ref_idx,
-                          solo_video=solo_video, solo_offset=float(solo_offset or 0))
+                          solo_video=solo_video, solo_offset=float(solo_offset or 0),
+                          merge_groups=_LAST.get("merges") or None)
     except ValueError as e:
         raise gr.Error(str(e))
     _LAST["res"] = res
@@ -223,7 +266,16 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
                     detect_btn = gr.Button("1. Find people")
                     people_gallery = gr.Gallery(label="Detected people", columns=4, height=180,
                                                 object_fit="contain")
+                    tracks_plot = gr.Plot(label="When each person is visible")
                     track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
+                    with gr.Accordion("Same person listed twice? Merge", open=False):
+                        gr.Markdown("Fragments are joined automatically when the tracker lost "
+                                    "someone and found them again. If the same person still "
+                                    "appears more than once, tick them here and merge.")
+                        merge_select = gr.CheckboxGroup(label="People to merge into one", choices=[])
+                        with gr.Row():
+                            merge_btn = gr.Button("Merge selected", size="sm")
+                            reset_merge_btn = gr.Button("Reset merges", size="sm")
 
                     ref_choice = gr.Radio([REF_COMPOSITE, REF_DANCER, REF_SOLO], value=REF_COMPOSITE,
                                           label="Deviation reference")
@@ -256,8 +308,12 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
             csv_out = gr.File(label="Per-frame deviation CSV")
 
             refresh_btn.click(lambda: gr.update(choices=list_runs()), outputs=run_dd)
-            detect_btn.click(run_detect, inputs=[run_dd, src_video],
-                             outputs=[people_gallery, track_select, ref_dancer])
+            people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot]
+            detect_btn.click(run_detect, inputs=[run_dd, src_video], outputs=people_outputs)
+            merge_btn.click(run_merge, inputs=[run_dd, src_video, merge_select],
+                            outputs=people_outputs)
+            reset_merge_btn.click(run_reset_merges, inputs=[run_dd, src_video],
+                                  outputs=people_outputs)
             track_select.change(update_ref_choices, inputs=[track_select, ref_dancer],
                                 outputs=ref_dancer)
             ref_choice.change(
@@ -312,5 +368,5 @@ setInterval(ddcAttachTimelineClick, 500);
 
 if __name__ == "__main__":
     RUNS_DIR.mkdir(exist_ok=True)
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, show_error=True,
+    demo.launch(server_name="127.0.0.1", server_port=int(os.environ.get("PORT", 7860)), share=False, show_error=True,
                 head=_CLICK_TO_SEEK_JS)

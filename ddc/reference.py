@@ -42,7 +42,7 @@ def reference_from_solo(solo_run_dir, t_group: np.ndarray, offset: float = 0.0,
     det = ddc_io.load_jsonl(Path(solo_run_dir) / "tracking.jsonl")
     if det.n_frames < 2:
         raise ValueError("solo reference video has too few frames")
-    ids, n_tracks = stabilize(det.kps)
+    ids, n_tracks = stabilize(det.kps, fps=(det.n_frames - 1) / max(det.t[-1] - det.t[0], 1e-9))
     if n_tracks == 0:
         raise ValueError("no persistent person found in the solo reference video")
     dense = to_dense(det.kps, ids, n_tracks)

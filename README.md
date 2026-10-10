@@ -63,6 +63,21 @@ since this is for analyzing a recorded clip rather than a live feed).
 `analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
 to call them directly from a script instead of the UI.
 
+### One person, one track (Find people)
+
+The frame-to-frame tracker forgets someone after ~0.3 s, so occlusions and detection
+dropouts used to come back as new "people". `ddc.tracking.stabilize` now joins those
+fragments afterwards (`stitch_tracklets`): fragments that never appear in the same
+frame and line up in position, size and motion across the gap (up to 5 s) become one
+person, *before* short tracks are discarded. On a 5-dancer clip this took 19 raw
+tracks to exactly 5. The Find people step shows a "when each person is visible"
+timeline and how many fragments were joined into each person.
+
+Geometry only (no appearance model), so people who cross paths or re-enter near each
+other can still be mixed up or left split. Under "Same person listed twice? Merge" in
+the Compare tab, tick the duplicates and click Merge (Reset merges undoes it); on the
+CLI use `--list-tracks` then `--merge 2,5` (repeatable).
+
 ### Deviation reference (Compare tab)
 
 The Compare tab scores each dancer's deviation against a reference pose. Pick one
