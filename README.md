@@ -63,6 +63,36 @@ since this is for analyzing a recorded clip rather than a live feed).
 `analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
 to call them directly from a script instead of the UI.
 
+### One person, one track (Find people)
+
+The frame-to-frame tracker forgets someone after ~0.3 s, so occlusions and detection
+dropouts used to come back as new "people". `ddc.tracking.stabilize` now joins those
+fragments afterwards (`stitch_tracklets`): fragments that never appear in the same
+frame and line up in position, size and motion across the gap (up to 5 s) become one
+person, *before* short tracks are discarded. On a 5-dancer clip this took 19 raw
+tracks to exactly 5. The Find people step shows a "when each person is visible"
+timeline and how many fragments were joined into each person.
+
+Geometry only (no appearance model), so people who cross paths or re-enter near each
+other can still be mixed up or left split. Under "Same person listed twice? Merge" in
+the Compare tab, tick the duplicates and click Merge (Reset merges undoes it); on the
+CLI use `--list-tracks` then `--merge 2,5` (repeatable).
+
+### Deviation reference (Compare tab)
+
+The Compare tab scores each dancer's deviation against a reference pose. Pick one
+under "Deviation reference":
+
+- **Composite of all dancers** (default) -- per-frame consensus of everyone kept.
+- **One of the dancers in this video** -- choose a dancer; everyone else is scored
+  against that dancer. The reference dancer is drawn in white as `REF` and isn't scored.
+- **Separate solo video** -- upload a solo clip (pose-tracked with RTMW, cached in
+  `runs/<ts>/reference_solo/`). Both videos are assumed to start together; use
+  "Solo offset (s)" to shift the solo's timeline if they don't.
+
+CLI equivalents: `python -m ddc.analyze runs/<ts> --reference dancer --reference-dancer 0`
+or `--reference solo --solo-video solo.mp4 --solo-offset 0.5`.
+
 ## Run the YOLO demo (body only, fast, live webcam)
 
 ```bash
@@ -99,6 +129,76 @@ python mediapipe_pose_demo.py --source video.mp4 --out out.jsonl
 python mediapipe_pose_demo.py --num-poses 2 --num-hands 4   # track 2 people
 python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
 ```
+
+## Evaluate dancer vs non-dancer pose features
+
+The detector deliberately labels every persistent person as a track; it does
+not infer whether somebody is dancing.  `ddc.dancer_features` collects five
+scale- and location-invariant track-level signals from a detector run:
+
+1. wrist height relative to the hips;
+2. wrist speed;
+3. limb extension (shoulder-to-wrist and hip-to-ankle reach);
+4. elbow/knee motion; and
+5. whole-pose motion.
+
+Create a small CSV which labels the tracks you have reviewed in a run:
+
+```csv
+track_id,label
+0,dancer
+1,dancer
+2,non_dancer
+3,non_dancer
+```
+
+Then run the evaluator (at least two tracks from each class are required):
+
+```bash
+python -m ddc.dancer_features runs/20261008-120000/tracking.jsonl labels.csv --out reports/my_run
+```
+
+It writes `track_features.csv`, `feature_selection_report.json`, and
+`feature_selection_accuracy.svg`.  The chart uses leave-one-track-out
+accuracy and compares each individual feature with three methods that select
+the best three features inside each validation fold: a **filter** (Fisher
+score), **wrapper** (greedy forward selection), and **embedded** (L1 logistic
+selection).  This prevents the accuracy graph from selecting features using
+the held-out track's label.
+
+For an end-to-end installation check only, use the synthetic example below.
+Its score is intentionally not a real-world model result.
+
+```bash
+python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
+```
+
+## Screen non-dancers before composite-pose analysis
+
+In the web UI, this screening now happens inside the **Compare** tab. Click
+**Find people** to score every saved track with the five standardized
+predictors displayed in `runs/dancer_feature_registry.xlsx`, generate a
+dancer-only pose overlay, and pre-select only the predicted dancers. It does
+**not** run pose detection again. The action also adds a Labels-style worksheet
+for the run. Use **Save reviewed labels** beside the checklist after changing
+the review: it updates Reviewed label, Validation status, and Correction
+recorded in that worksheet. Leaving the checklist unchanged and clicking
+**Compare** records the predictor labels as validated correct. Every saved
+review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
+the five predictors, followed by one labels sheet per run and one detailed
+sheet per validated dancer track.
+
+Track ids come from `ddc.tracking.stable_track_ids` (automatic stitching plus any manual
+merges), the same numbering the Find people list shows. Merging people re-scores the
+renumbered list, and **Save reviewed labels** stores the run's merges in `merges.json` beside
+`labels.csv` so labels keep pointing at the same people. `labels.csv` files written before
+track stitching used the old numbering; delete them (and `prediction_validation.json` /
+`feature_inventory.json`) and relabel those runs.
+
+Predictions for a run come from a model trained on *other* runs only, and
+camera-framing features (frame position, clip length, detected size) are never
+used as predictors. The Excel workbook (`runs/dancer_feature_registry.xlsx`) is written
+with `openpyxl`; if it cannot be built, the Compare tab still works and shows a note.
 
 **Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
 live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode

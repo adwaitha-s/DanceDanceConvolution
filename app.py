@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -17,13 +18,21 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import analyze_run, detect_tracks
-from ddc.plots import timeline_figure
+from ddc.feature_inventory import render_classifier_overlay
+from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
+                                  validate_checklist)
+from ddc.plots import timeline_figure, tracks_figure
 from ddc.skeleton import BODY
 from video_pipeline import analyze_video_mediapipe, analyze_video_rtmw, analyze_video_yolo
 
 MODEL_YOLO = "YOLO (body only, fast)"
 MODEL_MEDIAPIPE = "MediaPipe (body + hands, hands unreliable)"
 MODEL_RTMW = "RTMW (body + hands, multi-person, recommended)"
+
+REF_COMPOSITE = "Composite of all dancers"
+REF_DANCER = "One of the dancers in this video"
+REF_SOLO = "Separate solo video"
+REF_MODES = {REF_COMPOSITE: "composite", REF_DANCER: "dancer", REF_SOLO: "solo"}
 
 RUNS_DIR = Path(__file__).parent / "runs"
 
@@ -65,29 +74,159 @@ def list_runs() -> list[str]:
 _LAST: dict = {}
 
 
+def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
+    """Automatic track ids behind each displayed person, in display order (matches the
+    renumbering in ddc.tracking.merge_track_ids: merged people sort by lowest member)."""
+    target = {t: t for t in range(n_auto)}
+    for g in groups:
+        for t in g:
+            target[t] = min(g)
+    return [[t for t in range(n_auto) if target[t] == k] for k in sorted(set(target.values()))]
+
+
+def _predict_people(run_name, source_video, groups, tracks):
+    """Score the people currently shown and pick the predicted dancers.
+
+    Returns (selected labels, predicted-dancer overlay or None, note).  Scoring uses the
+    same merged track ids as the list on screen and holds this run out of training.
+    """
+    labels = [tr.label for tr in tracks]
+    try:
+        model, predictions = predict_run(RUNS_DIR, run_name, merge_groups=groups)
+    except ValueError as e:
+        # A first-ever run cannot be predicted until both classes have two human
+        # labels.  Keep the manual fallback explicit rather than silently training.
+        _LAST["predictions"] = []
+        return (labels, None,
+                f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
+
+    predicted_ids = frozenset(item["track_id"] for item in predictions
+                              if item["predicted_label"] == "dancer")
+    selected = [tr.label for tr in tracks if tr.track_id in predicted_ids]
+    _LAST["predictions"] = predictions
+    _LAST["model"] = model
+    _LAST["predicted_selected_ids"] = predicted_ids
+
+    # Overlay and workbook are conveniences: a failure in either must not discard
+    # the predictions above.  The overlay is built from existing JSON poses; no
+    # detector call is made here.
+    problems = []
+    overlay = None
+    try:
+        overlay = render_classifier_overlay(RUNS_DIR / run_name, show_non_dancers=False,
+                                            video_path=source_video, predictions=predictions,
+                                            merge_groups=groups)["overlay"]
+    except ValueError as e:
+        problems.append(f"Predicted-dancer overlay skipped: {e}.")
+    try:
+        # Add a Labels-style worksheet for this run immediately. Its local
+        # top-five weights populate once the checklist is validated.
+        rebuild_registry_workbook(RUNS_DIR)
+    except RuntimeError as e:
+        problems.append(f"Registry workbook refresh needs attention: {e}")
+
+    weights = "; ".join(f"{item['feature_name']}: {item['standardized_coefficient']:+.3f}"
+                        for item in model["selected_features"])
+    note = (f"Automatic checklist: {len(selected)} predicted dancer(s). Top-five model has "
+            f"{model['labelled_tracks']} validated track labels across {len(model['runs'])} run(s) "
+            f"(this run is held out of training). "
+            f"The checklist uses exactly these five standardized weights: {weights}. "
+            "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections. "
+            + " ".join(problems))
+    return selected, overlay, note.strip()
+
+
+def _show_people(run_name, source_video, groups):
+    """(Re)render the people list for the current merges and remember it.
+
+    Merging renumbers the people, so predictions are recomputed for the new numbering and
+    any earlier save/validation state is dropped.
+    """
+    try:
+        tracks = detect_tracks(RUNS_DIR / run_name, source_video, merge_groups=groups or None)
+    except ValueError as e:
+        raise gr.Error(str(e))
+    labels = [tr.label for tr in tracks]
+    _LAST["track_run"] = run_name
+    _LAST["track_labels"] = labels
+    _LAST["track_ids"] = {tr.label: tr.track_id for tr in tracks}
+    _LAST["merges"] = groups
+    for stale in ("saved_selection", "saved_validation", "predicted_selected_ids"):
+        _LAST.pop(stale, None)
+    selected, overlay, note = _predict_people(run_name, source_video, groups, tracks)
+    gallery = [(tr.thumbnail, tr.label) for tr in tracks]
+    return (gallery, gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
+            gr.update(choices=labels, value=[]), tracks_figure(tracks), overlay, note)
+
+
 def run_detect(run_name, source_video, progress=gr.Progress()):
     """Step 1: find every stabilized person track in the run and show a thumbnail
     for each, so the user can rule out bystanders/audience before anything is
     scored -- the tracker has no notion of "dancer" vs. "person on camera",
-    it keeps anyone visible for more than ~15 frames.
+    it keeps anyone visible for more than ~15 frames. Fragments of one person
+    that the tracker lost and re-found are joined automatically; "Merge" below
+    fixes any it missed.
     """
     if not run_name:
         raise gr.Error("Pick a run first (run an analysis on the Pose tracking tab).")
     progress(0.3, desc="Finding people in the clip...")
-    try:
-        tracks = detect_tracks(RUNS_DIR / run_name, source_video)
-    except ValueError as e:
-        raise gr.Error(str(e))
     _LAST.clear()
-    _LAST["track_run"] = run_name
-    _LAST["track_labels"] = [tr.label for tr in tracks]
-    gallery = [(tr.thumbnail, tr.label) for tr in tracks]
-    choices = [tr.label for tr in tracks]
-    return gallery, gr.update(choices=choices, value=choices)
+    out = _show_people(run_name, source_video, [])
+    _LAST["n_auto"] = len(out[0])
+    return out
+
+
+def run_merge(run_name, source_video, merge_choice):
+    """Treat the ticked people as one person (adds to any earlier merges)."""
+    labels = _LAST.get("track_labels")
+    if not labels or _LAST.get("track_run") != run_name:
+        raise gr.Error('Click "1. Find people" first.')
+    if len(merge_choice or []) < 2:
+        raise gr.Error("Tick at least two people to merge.")
+    members = _members(_LAST["n_auto"], _LAST.get("merges", []))
+    picked = sorted(labels.index(c) for c in merge_choice)
+    joined = sorted(t for i in picked for t in members[i])
+    groups = [m for i, m in enumerate(members) if len(m) > 1 and i not in picked] + [joined]
+    return _show_people(run_name, source_video, groups)
+
+
+def run_reset_merges(run_name, source_video):
+    if not _LAST.get("track_labels") or _LAST.get("track_run") != run_name:
+        raise gr.Error('Click "1. Find people" first.')
+    return _show_people(run_name, source_video, [])
+
+
+def update_ref_choices(track_choice, current):
+    """Reference-dancer dropdown offers only the people currently ticked as dancers."""
+    choices = list(track_choice or [])
+    return gr.update(choices=choices, value=current if current in choices else None)
+
+
+def save_review(run_name, track_choice, progress=gr.Progress()):
+    """Persist the current checklist without starting pose comparison."""
+    labels = _LAST.get("track_labels")
+    if not labels or _LAST.get("track_run") != run_name:
+        raise gr.Error('Click "1. Find people" before saving the reviewed checklist.')
+    selected = [_LAST["track_ids"][choice] for choice in (track_choice or [])]
+    progress(.25, desc="Saving reviewed dancer labels...")
+    try:
+        outcome = validate_checklist(RUNS_DIR, run_name, selected, _LAST.get("predictions", []),
+                                     merge_groups=_LAST.get("merges"))
+        _LAST["saved_selection"] = frozenset(selected)
+        _LAST["saved_validation"] = outcome["validation"]
+        workbook = rebuild_registry_workbook(RUNS_DIR)
+    except (RuntimeError, ValueError) as e:
+        raise gr.Error(f"Could not save the reviewed checklist: {e}")
+    progress(1, desc="Reviewed labels saved")
+    validation = outcome["validation"]
+    state = validation["status"].replace("_", " ")
+    return (f"**Reviewed labels saved.** Predictor labels {state}; "
+            f"{len(validation['corrected_track_ids'])} track correction(s) recorded. "
+            f"Updated {workbook.name}.")
 
 
 def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth,
-                progress=gr.Progress()):
+                ref_choice, ref_dancer, solo_video, solo_offset, progress=gr.Progress()):
     if not run_name:
         raise gr.Error("Pick a run first (run an analysis on the Pose tracking tab).")
     labels = _LAST.get("track_labels")
@@ -95,24 +234,61 @@ def run_compare(run_name, source_video, track_choice, loo_choice, rotate, smooth
         raise gr.Error('Click "1. Find people" first, then uncheck anyone who isn\'t a dancer.')
     if not track_choice:
         raise gr.Error("Select at least one person as a dancer.")
-    selected = [labels.index(c) for c in track_choice]
+    selected = [_LAST["track_ids"][c] for c in track_choice]
     loo = {"Auto (on for 3+ dancers)": None, "On": True, "Off": False}[loo_choice]
-    progress(0.1, desc="Building composite and deviation...")
+    mode = REF_MODES[ref_choice]
+    ref_idx = None
+    if mode == "dancer":
+        if ref_dancer not in track_choice:
+            raise gr.Error("Pick which dancer is the reference.")
+        ref_idx = sorted(selected).index(_LAST["track_ids"][ref_dancer])
+    elif mode == "solo" and not solo_video:
+        raise gr.Error("Upload a solo reference video.")
+    progress(0.1, desc="Analyzing solo reference video..." if mode == "solo"
+             else "Building reference and deviation...")
     try:
         res = analyze_run(RUNS_DIR / run_name, source_video, leave_one_out=loo,
-                          rotate=rotate, smooth=int(smooth), selected_tracks=selected)
+                          rotate=rotate, smooth=int(smooth), selected_tracks=selected,
+                          reference_mode=mode, reference_dancer=ref_idx,
+                          solo_video=solo_video, solo_offset=float(solo_offset or 0),
+                          merge_groups=_LAST.get("merges") or None)
     except ValueError as e:
         raise gr.Error(str(e))
     _LAST["res"] = res
+    validation_note = ""
+    if _LAST.get("predictions"):
+        baseline = _LAST.get("predicted_selected_ids", frozenset())
+        current = frozenset(selected)
+        if current == baseline:
+            # An untouched checklist is the explicit all-correct confirmation.
+            # Save it here so a reviewer can validate straight from Compare.
+            try:
+                outcome = validate_checklist(RUNS_DIR, run_name, selected, _LAST["predictions"],
+                                             merge_groups=_LAST.get("merges"))
+                _LAST["saved_selection"] = current
+                _LAST["saved_validation"] = outcome["validation"]
+                workbook = rebuild_registry_workbook(RUNS_DIR)
+                validation_note = (" Predictor labels validated correct; 0 track corrections stored. "
+                                   f"Accumulating workbook updated: {workbook.name}.")
+            except (RuntimeError, ValueError) as e:
+                validation_note = f" Checklist validation could not be saved: {e}"
+        elif _LAST.get("saved_selection") != current:
+            validation_note = (" Checklist changes have not been saved. Click **Save reviewed labels** "
+                               "to update the registry's Reviewed label, Validation status, and "
+                               "Correction recorded columns.")
+        else:
+            validation = _LAST.get("saved_validation", {})
+            validation_note = (f" Reviewed corrections are saved: "
+                               f"{len(validation.get('corrected_track_ids', []))} track correction(s).")
     progress(0.9, desc="Plotting...")
     rows = [[s["dancer"], s["frames_present"], round(s["mean_dev"], 3), s["worst_joint"],
              "; ".join(f"{t}s ({j})" for t, _, j in s["worst_moments"])] for s in res.summary]
     note = ""
-    if res.n_tracks == 2:
+    if res.n_tracks == 2 and mode == "composite":
         note = ("Only 2 dancers: the composite is their midpoint, so deviation is symmetric "
                 "(it measures how far apart they are, not who is off).")
     max_t = float(res.t[-1])
-    return (res.overlay_path, timeline_figure(res.dev, res.t), rows, note, res.csv_path,
+    return (res.overlay_path, timeline_figure(res.dev, res.t), rows, note + validation_note, res.csv_path,
             gr.update(maximum=max_t, value=0))
 
 
@@ -123,6 +299,9 @@ def frame_detail(t_sec):
     f = int(np.argmin(np.abs(res.t - t_sec)))
     lines = [f"t={res.t[f]:.2f}s (frame {f}), {int(res.dev.n_present[f])} dancer(s) present"]
     for d in range(res.n_tracks):
+        if d == res.dev.reference_track:
+            lines.append(f"Dancer {d + 1}: reference")
+            continue
         j = res.dev.joint[f, d]
         if not np.isfinite(j).any():
             lines.append(f"Dancer {d + 1}: not visible")
@@ -176,9 +355,10 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
         with gr.Tab("Compare"):
             gr.Markdown(
                 "# Composite pose and deviation\n"
-                "Builds a per-frame consensus pose from all dancers, then shows how far "
-                "each dancer is from it. Skeleton colour: green = close, red = far "
-                "(distance in torso lengths). White ghost = composite."
+                "Measures how far each dancer is from a reference pose, frame by frame: a "
+                "consensus of all dancers, one chosen dancer, or a separate solo video. "
+                "Skeleton colour: green = close, red = far (distance in torso lengths). "
+                "White ghost = reference."
             )
             with gr.Row():
                 with gr.Column(scale=1):
@@ -189,16 +369,40 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
                         label="Original video (optional; otherwise the run's overlay is dimmed as background)")
 
                     gr.Markdown(
-                        "**1. Find people.** The tracker keeps anyone visible for more than "
-                        "~15 frames -- it doesn't know who's actually dancing. Uncheck anyone "
-                        "here who's a bystander, audience, or otherwise not a dancer before "
-                        "comparing; unchecked people are excluded from the composite entirely."
+                        "**1. Find and predict dancers.** The checklist is automatically selected "
+                        "from the accumulating feature model. Non-dancers are deselected in the "
+                        "same tab and hidden from the predicted-dancer pose overlay. Leave it alone "
+                        "to validate the labels; make changes to correct and retrain the model."
                     )
                     detect_btn = gr.Button("1. Find people")
                     people_gallery = gr.Gallery(label="Detected people", columns=4, height=180,
                                                 object_fit="contain")
-                    track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
+                    tracks_plot = gr.Plot(label="When each person is visible")
+                    with gr.Row():
+                        track_select = gr.CheckboxGroup(label="Include as dancer", choices=[], scale=4)
+                        save_review_btn = gr.Button("Save reviewed labels", size="sm", scale=1)
+                    predictor_note = gr.Markdown()
+                    predicted_overlay = gr.Video(label="Predicted dancers pose overlay")
+                    with gr.Accordion("Same person listed twice? Merge", open=False):
+                        gr.Markdown("Fragments are joined automatically when the tracker lost "
+                                    "someone and found them again. If the same person still "
+                                    "appears more than once, tick them here and merge. Merging "
+                                    "renumbers people, so the dancer predictions are recomputed.")
+                        merge_select = gr.CheckboxGroup(label="People to merge into one", choices=[])
+                        with gr.Row():
+                            merge_btn = gr.Button("Merge selected", size="sm")
+                            reset_merge_btn = gr.Button("Reset merges", size="sm")
 
+                    ref_choice = gr.Radio([REF_COMPOSITE, REF_DANCER, REF_SOLO], value=REF_COMPOSITE,
+                                          label="Deviation reference")
+                    ref_dancer = gr.Dropdown(
+                        [], value=None, visible=False,
+                        label="Reference dancer (everyone else is scored against this person)")
+                    solo_video = gr.Video(label="Solo reference video", visible=False)
+                    solo_offset = gr.Number(
+                        value=0, visible=False,
+                        label="Solo offset (s): seconds into the solo video that line up with the "
+                              "start of the group video (negative = solo starts later)")
                     loo_choice = gr.Radio(["Auto (on for 3+ dancers)", "On", "Off"],
                                           value="Auto (on for 3+ dancers)",
                                           label="Leave-one-out composite")
@@ -220,10 +424,23 @@ with gr.Blocks(title="DanceDanceConvolution - Pose Tracking") as demo:
             csv_out = gr.File(label="Per-frame deviation CSV")
 
             refresh_btn.click(lambda: gr.update(choices=list_runs()), outputs=run_dd)
-            detect_btn.click(run_detect, inputs=[run_dd, src_video],
-                             outputs=[people_gallery, track_select])
+            people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
+                              predicted_overlay, predictor_note]
+            detect_btn.click(run_detect, inputs=[run_dd, src_video], outputs=people_outputs)
+            merge_btn.click(run_merge, inputs=[run_dd, src_video, merge_select],
+                            outputs=people_outputs)
+            reset_merge_btn.click(run_reset_merges, inputs=[run_dd, src_video],
+                                  outputs=people_outputs)
+            track_select.change(update_ref_choices, inputs=[track_select, ref_dancer],
+                                outputs=ref_dancer)
+            ref_choice.change(
+                lambda c: (gr.update(visible=c == REF_DANCER), gr.update(visible=c == REF_SOLO),
+                           gr.update(visible=c == REF_SOLO), gr.update(visible=c == REF_COMPOSITE)),
+                inputs=ref_choice, outputs=[ref_dancer, solo_video, solo_offset, loo_choice])
+            save_review_btn.click(save_review, inputs=[run_dd, track_select], outputs=predictor_note)
             cmp_btn.click(run_compare,
-                          inputs=[run_dd, src_video, track_select, loo_choice, rotate, smooth],
+                          inputs=[run_dd, src_video, track_select, loo_choice, rotate, smooth,
+                                  ref_choice, ref_dancer, solo_video, solo_offset],
                           outputs=[cmp_video, timeline, summary_tbl, cmp_note, csv_out, t_slider])
             t_slider.change(frame_detail, inputs=t_slider, outputs=detail)
 
@@ -269,5 +486,5 @@ setInterval(ddcAttachTimelineClick, 500);
 
 if __name__ == "__main__":
     RUNS_DIR.mkdir(exist_ok=True)
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, show_error=True,
+    demo.launch(server_name="127.0.0.1", server_port=int(os.environ.get("PORT", 7860)), share=False, show_error=True,
                 head=_CLICK_TO_SEEK_JS)

@@ -211,7 +211,7 @@ def test_excluding_a_bystander_track_removes_it_from_the_composite(tmp_path):
     frames = []
     for f in range(F):
         dancer1 = place(base_pose(), 200, 300, 40)
-        dancer2 = place(base_pose(), 200, 300, 40)          # identical to dancer1
+        dancer2 = place(base_pose(), 500, 300, 40)          # same pose as dancer1, elsewhere on screen
         bystander = place(neutral_pose(), 900, 900, 30)      # different pose, off to the side
         frames.append([dancer1, dancer2, bystander])
     run_dir = _write_jsonl_run(tmp_path, frames)
