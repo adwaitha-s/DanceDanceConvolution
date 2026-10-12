@@ -145,6 +145,7 @@ def analyze_video_yolo(
     conf: float = 0.5,
     imgsz: int = 640,
     track: bool = True,
+    on_progress=None,
 ) -> dict:
     """Run YOLO pose over every frame of video_path. Returns a summary dict."""
     device = device or _best_device()
@@ -162,6 +163,7 @@ def analyze_video_yolo(
     writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     predict_kwargs = dict(conf=conf, imgsz=imgsz, device=device, verbose=False)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
     max_people = 0
     try:
@@ -182,6 +184,8 @@ def analyze_video_yolo(
 
                 writer.write(result.plot())
                 frame_idx += 1
+                if on_progress is not None:
+                    on_progress(frame_idx, total)
     finally:
         cap.release()
         writer.release()
@@ -198,6 +202,7 @@ def analyze_video_mediapipe(
     num_poses: int = 1,
     num_hands: int = 2,
     min_conf: float = 0.5,
+    on_progress=None,
 ) -> dict:
     """Run MediaPipe pose+hands over every frame of video_path. Returns a summary dict."""
     pose_model = mpd.ensure_model(mpd.MODELS_DIR / "pose_landmarker_lite.task", mpd.POSE_MODEL_URL)
@@ -236,6 +241,7 @@ def analyze_video_mediapipe(
     raw_video = out_video.with_suffix(".raw.mp4")
     writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
     max_people = 0
     max_hands = 0
@@ -271,6 +277,8 @@ def analyze_video_mediapipe(
                     mpd.draw_landmarks(frame, pts, mpd.HAND_CONNECTIONS, color)
                 writer.write(frame)
                 frame_idx += 1
+                if on_progress is not None:
+                    on_progress(frame_idx, total)
     finally:
         cap.release()
         writer.release()
@@ -319,6 +327,7 @@ def analyze_video_rtmw(
     out_video: str,
     mode: str = "lightweight",
     hand_conf: float = 0.3,
+    on_progress=None,
 ) -> dict:
     """Run RTMW (RTMPose whole-body, via rtmlib) over every frame of video_path.
 
@@ -369,6 +378,7 @@ def analyze_video_rtmw(
     raw_video = out_video.with_suffix(".raw.mp4")
     writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
     max_people = 0
     max_hands = 0
@@ -405,6 +415,8 @@ def analyze_video_rtmw(
                     frame = draw_skeleton(frame, keypoints, draw_scores, kpt_thr=0.3)
                 writer.write(frame)
                 frame_idx += 1
+                if on_progress is not None:
+                    on_progress(frame_idx, total)
     finally:
         cap.release()
         writer.release()

@@ -12,8 +12,8 @@ them up. Three detectors are available in the web UI / `video_pipeline.py`:
 | **MediaPipe** | Capped, needs a slider | Yes, but unreliable | Hands not linked to a body. Measured only 15% frame coverage on hands (0% with both hands at once) on a 1-dancer clip -- see [Known limitations](#known-limitations). |
 
 - **`app.py`** + **`video_pipeline.py`** -- the main workflow: a local web UI
-  to upload a video and get back an overlay video and a tracking JSONL. See
-  [Web UI](#web-ui-video-in-tracking-json--overlay-video-out) below.
+  to upload a video, pick the dancers and see who deviates and when. See
+  [Web UI](#web-ui) below.
 - **`pose_demo.py`** -- YOLO11 pose, live webcam demo. Fast, 17-keypoint COCO
   body pose only (no hands).
 - **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker,
@@ -38,14 +38,26 @@ overlay export uses `ffmpeg` if it's on your `PATH` (`brew install ffmpeg`)
 to produce a browser-playable H.264 file; without it, the overlay is still
 written but in a codec most browsers won't preview inline.
 
-## Web UI (video in, tracking JSON + overlay video out)
+## Web UI
 
 ```bash
 python app.py
 ```
 
-Opens a local Gradio app at http://127.0.0.1:7860. Upload a video, pick a
-model, click Analyze:
+Opens a local Gradio app at http://127.0.0.1:7860. One page, three steps; each
+step opens the next by itself:
+
+1. **Video** -- upload a clip and click *Analyze video*, or pick a clip you
+   already analyzed under *Previous runs* and click *Open run*. The uploaded
+   video is kept with the run, so it is never asked for again.
+2. **Dancers** -- everyone found in the clip, with the predicted dancers
+   already ticked. Fix the ticks if needed, choose what to compare against,
+   click *Compare dancers*.
+3. **Results** -- the deviation overlay video beside the timeline. A line on
+   the timeline follows the video; clicking the timeline, dragging *Inspect
+   time* or clicking a *Worst moments* row jumps the video there.
+
+The pose model is under *Pose model (advanced)* in step 1:
 
 - **YOLO** (body only, fast) -- no configuration needed.
 - **RTMW** (body + hands, multi-person) -- recommended when you need hands;
@@ -54,34 +66,40 @@ model, click Analyze:
   least how many dancers are in frame (defaults to 4); expect hands to drop
   out often (see the table above).
 
-Each run writes to `runs/<timestamp>/`: `overlay.mp4` (annotated video) and
-`tracking.jsonl` (one JSON record per frame -- formats documented below,
+MediaPipe runs are tracking-only (they can't be compared in steps 2-3).
+
+Each run writes to `runs/<timestamp>/`: `overlay.mp4` (annotated video),
+`source.<ext>` (the upload), `meta.json` (file name, model, length -- used to
+name the run in *Previous runs*) and `tracking.jsonl` (one JSON record
+per frame -- formats documented below,
 `t` is seconds into the video, i.e. `frame / fps`, not wall-clock time,
-since this is for analyzing a recorded clip rather than a live feed).
+since this is for analyzing a recorded clip rather than a live feed). The
+overlay and JSONL can also be downloaded under *Raw tracking output* in step 1.
+Set `DDC_RUNS_DIR` to keep runs somewhere other than `./runs`.
 
 `video_pipeline.py` has the underlying `analyze_video_yolo()`,
 `analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
 to call them directly from a script instead of the UI.
 
-### One person, one track (Find people)
+### One person, one track (step 2)
 
 The frame-to-frame tracker forgets someone after ~0.3 s, so occlusions and detection
 dropouts used to come back as new "people". `ddc.tracking.stabilize` now joins those
 fragments afterwards (`stitch_tracklets`): fragments that never appear in the same
 frame and line up in position, size and motion across the gap (up to 5 s) become one
 person, *before* short tracks are discarded. On a 5-dancer clip this took 19 raw
-tracks to exactly 5. The Find people step shows a "when each person is visible"
+tracks to exactly 5. Step 2 shows a "when each person is visible"
 timeline and how many fragments were joined into each person.
 
 Geometry only (no appearance model), so people who cross paths or re-enter near each
 other can still be mixed up or left split. Under "Same person listed twice? Merge" in
-the Compare tab, tick the duplicates and click Merge (Reset merges undoes it); on the
+step 2, tick the duplicates and click Merge (Reset merges undoes it); on the
 CLI use `--list-tracks` then `--merge 2,5` (repeatable).
 
-### Deviation reference (Compare tab)
+### Deviation reference (step 2)
 
-The Compare tab scores each dancer's deviation against a reference pose. Pick one
-under "Deviation reference":
+Step 3 scores each dancer's deviation against a reference pose. Pick one
+under "Compare each dancer against":
 
 - **Composite of all dancers** (default) -- per-frame consensus of everyone kept.
 - **One of the dancers in this video** -- choose a dancer; everyone else is scored
@@ -175,10 +193,10 @@ python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
 
 ## Screen non-dancers before composite-pose analysis
 
-In the web UI, this screening now happens inside the **Compare** tab. Click
-**Find people** to score every saved track with the five standardized
-predictors displayed in `runs/dancer_feature_registry.xlsx`, generate a
-dancer-only pose overlay, and pre-select only the predicted dancers. It does
+In the web UI, this screening happens in step 2 (**Dancers**). Opening a run
+there scores every saved track with the five standardized
+predictors displayed in `runs/dancer_feature_registry.xlsx`, generates a
+dancer-only pose overlay, and pre-selects only the predicted dancers. It does
 **not** run pose detection again. The action also adds a Labels-style worksheet
 for the run. Use **Save reviewed labels** beside the checklist after changing
 the review: it updates Reviewed label, Validation status, and Correction
@@ -189,7 +207,7 @@ the five predictors, followed by one labels sheet per run and one detailed
 sheet per validated dancer track.
 
 Track ids come from `ddc.tracking.stable_track_ids` (automatic stitching plus any manual
-merges), the same numbering the Find people list shows. Merging people re-scores the
+merges), the same numbering the step 2 people list shows. Merging people re-scores the
 renumbered list, and **Save reviewed labels** stores the run's merges in `merges.json` beside
 `labels.csv` so labels keep pointing at the same people. `labels.csv` files written before
 track stitching used the old numbering; delete them (and `prediction_validation.json` /
@@ -198,7 +216,7 @@ track stitching used the old numbering; delete them (and `prediction_validation.
 Predictions for a run come from a model trained on *other* runs only, and
 camera-framing features (frame position, clip length, detected size) are never
 used as predictors. The Excel workbook (`runs/dancer_feature_registry.xlsx`) is written
-with `openpyxl`; if it cannot be built, the Compare tab still works and shows a note.
+with `openpyxl`; if it cannot be built, comparing still works and shows a note.
 
 **Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
 live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode

@@ -47,7 +47,9 @@ def tracks_figure(tracks) -> go.Figure:
     return fig
 
 
-def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
+def timeline_figure(dev: Deviation, t: np.ndarray, height: int | None = None) -> go.Figure:
+    """`height` (px) defaults to a size that grows with the number of heatmap rows, clamped
+    so the figure still fits next to the video on a laptop screen."""
     T = dev.score.shape[1]
     source = {"composite": "composite", "solo": "solo reference",
               "dancer": f"Dancer {(dev.reference_track or 0) + 1} (reference)"}[dev.mode]
@@ -91,6 +93,8 @@ def timeline_figure(dev: Deviation, t: np.ndarray) -> go.Figure:
 
     fig.update_yaxes(autorange="reversed", row=2, col=1)
     fig.update_xaxes(title_text="time (s)", row=2, col=1)
-    fig.update_layout(height=560, margin=dict(l=70, r=20, t=50, b=40), hovermode="x unified",
-                      legend=dict(orientation="h", y=1.12))
+    if height is None:
+        height = int(min(720, max(420, 300 + 16 * len(labels))))
+    fig.update_layout(height=height, margin=dict(l=70, r=10, t=50, b=40), hovermode="x unified",
+                      legend=dict(orientation="h", y=1.12, x=1, xanchor="right"))
     return fig

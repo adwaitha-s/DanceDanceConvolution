@@ -39,7 +39,7 @@ def _frame_source(video_path, n_frames):
 
 
 def render_overlay(dense, dev, origin, scale, rot, t, out_path, video_path=None,
-                   dim: float = 1.0, fps: float | None = None):
+                   dim: float = 1.0, fps: float | None = None, on_progress=None):
     """Write an mp4. `dim`<1 darkens the background (use ~0.35 for the pre-drawn overlay).
 
     Background frames are read frame-index-aligned with `dense`/`dev` (frame f of
@@ -125,6 +125,8 @@ def render_overlay(dense, dev, origin, scale, rot, t, out_path, video_path=None,
             cv2.putText(canvas, f"t={t[f]:.2f}s  dancers={int(dev.n_present[f])}", (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             vw.write(canvas)
+            if on_progress is not None:
+                on_progress(f + 1, F)
         vw.release()
 
     final = _reencode_h264(raw, Path(out_path))
