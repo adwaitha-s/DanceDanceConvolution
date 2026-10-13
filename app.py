@@ -23,7 +23,7 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
-from ddc.feature_inventory import render_classifier_overlay
+from ddc.overlay_cache import render_dancer_overlay
 from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
                                   validate_checklist)
 from ddc.plots import timeline_figure, tracks_figure
@@ -188,7 +188,7 @@ def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
 def _predict_people(run_name, groups, tracks):
     """Score the people currently shown and pick the predicted dancers.
 
-    Returns (selected labels, predicted-dancer overlay or None, note).  Scoring uses the
+    Returns (selected labels, note).  Scoring uses the
     same merged track ids as the list on screen and holds this run out of training.
     """
     labels = [tr.label for tr in tracks]
@@ -198,7 +198,7 @@ def _predict_people(run_name, groups, tracks):
         # A first-ever run cannot be predicted until both classes have two human
         # labels.  Keep the manual fallback explicit rather than silently training.
         _LAST["predictions"] = []
-        return (labels, None,
+        return (labels,
                 f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
 
     predicted_ids = frozenset(item["track_id"] for item in predictions
@@ -208,17 +208,10 @@ def _predict_people(run_name, groups, tracks):
     _LAST["model"] = model
     _LAST["predicted_selected_ids"] = predicted_ids
 
-    # Overlay and workbook are conveniences: a failure in either must not discard
-    # the predictions above.  The overlay is built from existing JSON poses; no
-    # detector call is made here.
+    # The workbook is a convenience: a failure must not discard the predictions above.
+    # The preview video is NOT rendered here -- it re-encodes the whole clip and takes
+    # a while, so it is only built when asked (see run_render_overlay).
     problems = []
-    overlay = None
-    try:
-        overlay = render_classifier_overlay(RUNS_DIR / run_name, show_non_dancers=False,
-                                            predictions=predictions,
-                                            merge_groups=groups)["overlay"]
-    except ValueError as e:
-        problems.append(f"Predicted-dancer overlay skipped: {e}.")
     try:
         # Add a Labels-style worksheet for this run immediately. Its local
         # top-five weights populate once the checklist is validated.
@@ -234,7 +227,7 @@ def _predict_people(run_name, groups, tracks):
             f"The checklist uses exactly these five standardized weights: {weights}. "
             "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections. "
             + " ".join(problems))
-    return selected, overlay, note.strip()
+    return selected, note.strip()
 
 
 def _review_status(track_choice) -> str:
@@ -270,8 +263,8 @@ def _show_people(run_name, groups, progress=None):
     for stale in ("saved_selection", "saved_validation", "predicted_selected_ids"):
         _LAST.pop(stale, None)
     if progress is not None:
-        progress(0.5, desc="Predicting dancers and rendering the preview...")
-    selected, overlay, note = _predict_people(run_name, groups, tracks)
+        progress(0.5, desc="Predicting dancers...")
+    selected, note = _predict_people(run_name, groups, tracks)
     if _LAST.get("predictions"):
         headline = (f"**{len(selected)} of {len(labels)} people** were automatically selected as "
                     "dancers. Untick anyone who isn't dancing, tick anyone who was missed.")
@@ -281,7 +274,7 @@ def _show_people(run_name, groups, progress=None):
     gallery = [(tr.thumbnail, tr.label) for tr in tracks]
     return (gallery, gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
             gr.update(choices=labels, value=[]), tracks_figure(tracks),
-            gr.update(value=overlay, visible=overlay is not None), note, headline,
+            gr.update(value=None, visible=False), note, headline,  # preview is on demand
             _review_status(selected), gr.update(interactive=True))
 
 
@@ -352,6 +345,22 @@ def update_ref_choices(track_choice, current):
     """Reference-dancer dropdown offers only the people currently ticked as dancers."""
     choices = list(track_choice or [])
     return gr.update(choices=choices, value=current if current in choices else None)
+
+
+@_friendly("Rendering the preview")
+def run_render_overlay(run_name, track_choice, progress=gr.Progress()):
+    """Render (or reuse) the preview showing only the people currently ticked as dancers."""
+    _require_people(run_name)
+    if not track_choice:
+        raise gr.Error("Tick at least one person as a dancer to preview.")
+    dancers = [_LAST["track_ids"][c] for c in track_choice]
+    result = render_dancer_overlay(
+        RUNS_DIR / run_name, dancers, list(_LAST["track_ids"].values()),
+        merge_groups=_LAST.get("merges"), progress=lambda f, d: progress(f, desc=d))
+    how = ("reused an identical earlier render" if result["cached"]
+           else f"rendered in {result['seconds']:.0f} s")
+    return gr.update(value=result["overlay"], visible=True,
+                     label=f"Preview: ticked dancers only ({how})")
 
 
 def save_review(run_name, track_choice, progress=gr.Progress()):
@@ -550,6 +559,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     with gr.Accordion("How the automatic selection was made", open=False):
                         predictor_note = gr.Markdown()
                 with gr.Column(scale=2):
+                    render_overlay_btn = gr.Button(
+                        "Render preview of the ticked dancers (takes a while)", size="sm")
                     predicted_overlay = gr.Video(label="Preview: predicted dancers only",
                                                  elem_id="ddc_pred_video", visible=False)
                     tracks_plot = gr.Plot(label="When each person is visible")
@@ -651,6 +662,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                    gr.update(visible=c == REF_SOLO), gr.update(visible=c == REF_COMPOSITE)),
         inputs=ref_choice, outputs=[ref_dancer, solo_video, solo_offset, loo_choice])
     save_review_btn.click(save_review, inputs=[active_run, track_select], outputs=review_status)
+    render_overlay_btn.click(run_render_overlay, inputs=[active_run, track_select],
+                             outputs=predicted_overlay, show_progress_on=predicted_overlay)
     cmp_btn.click(run_compare,
                   inputs=[active_run, track_select, loo_choice, rotate, smooth,
                           ref_choice, ref_dancer, solo_video, solo_offset],
