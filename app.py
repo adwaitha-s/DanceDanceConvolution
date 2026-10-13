@@ -533,11 +533,6 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     people_headline = gr.Markdown()
                     people_gallery = gr.Gallery(label="Detected people", columns=4, height=220,
                                                 object_fit="contain")
-                    track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
-                    with gr.Row():
-                        review_status = gr.Markdown()
-                        save_review_btn = gr.Button("Save reviewed labels", size="sm", scale=0,
-                                                    min_width=180)
                     with gr.Accordion("Same person listed twice? Merge", open=False):
                         gr.Markdown("Fragments are joined automatically when the tracker lost "
                                     "someone and found them again. If the same person still "
@@ -547,6 +542,11 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                         with gr.Row():
                             merge_btn = gr.Button("Merge selected", size="sm")
                             reset_merge_btn = gr.Button("Reset merges", size="sm")
+                    track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
+                    with gr.Row():
+                        review_status = gr.Markdown()
+                        save_review_btn = gr.Button("Save reviewed labels", size="sm", scale=0,
+                                                    min_width=180)
                     with gr.Accordion("How the automatic selection was made", open=False):
                         predictor_note = gr.Markdown()
                 with gr.Column(scale=2):
