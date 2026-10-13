@@ -23,7 +23,8 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
-from ddc.overlay_cache import render_dancer_overlay
+from ddc.coaching import SCORE_EXPLANATION, feedback_moments, joint_feedback
+from ddc.feature_inventory import render_classifier_overlay
 from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
                                   validate_checklist)
 from ddc.plots import timeline_figure, tracks_figure
@@ -188,7 +189,7 @@ def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
 def _predict_people(run_name, groups, tracks):
     """Score the people currently shown and pick the predicted dancers.
 
-    Returns (selected labels, note).  Scoring uses the
+    Returns (selected labels, predicted-dancer overlay or None, note).  Scoring uses the
     same merged track ids as the list on screen and holds this run out of training.
     """
     labels = [tr.label for tr in tracks]
@@ -198,7 +199,7 @@ def _predict_people(run_name, groups, tracks):
         # A first-ever run cannot be predicted until both classes have two human
         # labels.  Keep the manual fallback explicit rather than silently training.
         _LAST["predictions"] = []
-        return (labels,
+        return (labels, None,
                 f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
 
     predicted_ids = frozenset(item["track_id"] for item in predictions
@@ -208,10 +209,17 @@ def _predict_people(run_name, groups, tracks):
     _LAST["model"] = model
     _LAST["predicted_selected_ids"] = predicted_ids
 
-    # The workbook is a convenience: a failure must not discard the predictions above.
-    # The preview video is NOT rendered here -- it re-encodes the whole clip and takes
-    # a while, so it is only built when asked (see run_render_overlay).
+    # Overlay and workbook are conveniences: a failure in either must not discard
+    # the predictions above.  The overlay is built from existing JSON poses; no
+    # detector call is made here.
     problems = []
+    overlay = None
+    try:
+        overlay = render_classifier_overlay(RUNS_DIR / run_name, show_non_dancers=False,
+                                            predictions=predictions,
+                                            merge_groups=groups)["overlay"]
+    except ValueError as e:
+        problems.append(f"Predicted-dancer overlay skipped: {e}.")
     try:
         # Add a Labels-style worksheet for this run immediately. Its local
         # top-five weights populate once the checklist is validated.
@@ -227,7 +235,7 @@ def _predict_people(run_name, groups, tracks):
             f"The checklist uses exactly these five standardized weights: {weights}. "
             "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections. "
             + " ".join(problems))
-    return selected, note.strip()
+    return selected, overlay, note.strip()
 
 
 def _review_status(track_choice) -> str:
@@ -263,8 +271,8 @@ def _show_people(run_name, groups, progress=None):
     for stale in ("saved_selection", "saved_validation", "predicted_selected_ids"):
         _LAST.pop(stale, None)
     if progress is not None:
-        progress(0.5, desc="Predicting dancers...")
-    selected, note = _predict_people(run_name, groups, tracks)
+        progress(0.5, desc="Predicting dancers and rendering the preview...")
+    selected, overlay, note = _predict_people(run_name, groups, tracks)
     if _LAST.get("predictions"):
         headline = (f"**{len(selected)} of {len(labels)} people** were automatically selected as "
                     "dancers. Untick anyone who isn't dancing, tick anyone who was missed.")
@@ -274,7 +282,7 @@ def _show_people(run_name, groups, progress=None):
     gallery = [(tr.thumbnail, tr.label) for tr in tracks]
     return (gallery, gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
             gr.update(choices=labels, value=[]), tracks_figure(tracks),
-            gr.update(value=None, visible=False), note, headline,  # preview is on demand
+            gr.update(value=overlay, visible=overlay is not None), note, headline,
             _review_status(selected), gr.update(interactive=True))
 
 
@@ -284,7 +292,7 @@ N_PEOPLE_OUTPUTS = 10   # length of the tuple _show_people returns
 def begin_review(run_name):
     """Jump to step 2 for `run_name` and blank everything left over from another run."""
     if not run_name:
-        return [gr.skip()] * 20
+        return [gr.skip()] * 21
     return (gr.Tabs(selected=TAB_DANCERS),
             f"### {_run_label(RUNS_DIR / run_name)}",
             # step 2
@@ -292,7 +300,7 @@ def begin_review(run_name):
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
             "Finding people...", "", gr.update(interactive=False),
             # step 3
-            NO_RESULT_HINT, None, None, [], [], "", None, "")
+            NO_RESULT_HINT, None, None, [], [], "", None, "", [])
 
 
 @_friendly("Finding people")
@@ -345,22 +353,6 @@ def update_ref_choices(track_choice, current):
     """Reference-dancer dropdown offers only the people currently ticked as dancers."""
     choices = list(track_choice or [])
     return gr.update(choices=choices, value=current if current in choices else None)
-
-
-@_friendly("Rendering the preview")
-def run_render_overlay(run_name, track_choice, progress=gr.Progress()):
-    """Render (or reuse) the preview showing only the people currently ticked as dancers."""
-    _require_people(run_name)
-    if not track_choice:
-        raise gr.Error("Tick at least one person as a dancer to preview.")
-    dancers = [_LAST["track_ids"][c] for c in track_choice]
-    result = render_dancer_overlay(
-        RUNS_DIR / run_name, dancers, list(_LAST["track_ids"].values()),
-        merge_groups=_LAST.get("merges"), progress=lambda f, d: progress(f, desc=d))
-    how = ("reused an identical earlier render" if result["cached"]
-           else f"rendered in {result['seconds']:.0f} s")
-    return gr.update(value=result["overlay"], visible=True,
-                     label=f"Preview: ticked dancers only ({how})")
 
 
 def save_review(run_name, track_choice, progress=gr.Progress()):
@@ -448,11 +440,16 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     names = [f"Dancer {d + 1} ({p})" if renumbered else f"Dancer {d + 1}"
              for d, p in enumerate(people)]
 
+    _LAST["names"] = names
     rows, moments = [], []
     for d, s in enumerate(res.summary):
         if d == res.dev.reference_track:
             continue
-        rows.append([names[d], s["frames_present"], round(s["mean_dev"], 3), s["worst_joint"]])
+        c = res.coaching.dancers[d]
+        rows.append([names[d], round(c["score"], 1) if c["score"] is not None else "N/A",
+                     f'{c["valid_frames"]}/{c["total_frames"]} ({c["coverage"]:.0%})',
+                     round(s["mean_dev"], 3) if np.isfinite(s["mean_dev"]) else "N/A",
+                     c["strength"], c["improvement"]])
         moments += [[names[d], t, joint, score] for t, score, joint in s["worst_moments"]]
     moments.sort(key=lambda m: -m[3])
 
@@ -462,11 +459,16 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     if res.n_tracks == 2 and mode == "composite":
         note = ("Only 2 dancers: the composite is their midpoint, so deviation is symmetric "
                 "(it measures how far apart they are, not who is off).")
+    overall = res.coaching.overall
+    overall_label = f"{overall:.1f}/100" if overall is not None else "N/A — insufficient comparable pose data"
+    note = f"**Overall movement similarity: {overall_label}** (heuristic).\n\n" + note
+    feedback = [[names[d], tm, message] for d, tm, message in
+                feedback_moments(res.dev, res.norm, res.coaching, res.t, res.rotate)]
     max_t = float(res.t[-1])
     return (gr.Tabs(selected=TAB_RESULTS), f"### {_run_label(RUNS_DIR / run_name)}",
             res.overlay_path, timeline_figure(res.dev, res.t), rows, moments,
             note + validation_note, res.csv_path, gr.update(maximum=max_t, value=0),
-            frame_detail(0), _review_status(track_choice))
+            frame_detail(0), _review_status(track_choice), feedback)
 
 
 def jump_to_moment(rows, evt: gr.SelectData):
@@ -484,13 +486,19 @@ def frame_detail(t_sec):
         if d == res.dev.reference_track:
             lines.append(f"Dancer {d + 1}: reference")
             continue
-        j = res.dev.joint[f, d]
+        name = _LAST.get("names", [f"Dancer {i + 1}" for i in range(res.n_tracks)])[d]
+        j = res.coaching.joint[f, d]
         if not np.isfinite(j).any():
-            lines.append(f"Dancer {d + 1}: not visible")
+            lines.append(f"{name}: insufficient comparable pose data (dancer or reference missing, "
+                         "too few reliable joints, or no peer for the composite).")
             continue
-        top = np.argsort(-np.nan_to_num(j, nan=-1))[:3]
-        lines.append(f"Dancer {d + 1}: score {res.dev.score[f, d]:.2f}; worst: " +
-                     ", ".join(f"{BODY[i]} {j[i]:.2f}" for i in top))
+        score = res.coaching.frame_score[f, d]
+        lines.append(f"{name}: movement similarity {score:.1f}/100; "
+                     f"deviation {res.coaching.deviation[f, d]:.2f} torso lengths.")
+        top = np.flatnonzero(np.isfinite(j))
+        top = top[np.argsort(-j[top])][:3]
+        lines.extend(joint_feedback(res.dev, res.norm, res.coaching, f, d, i, res.t[f], res.rotate)
+                     for i in top)
     return "\n".join(lines)
 
 
@@ -559,8 +567,6 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     with gr.Accordion("How the automatic selection was made", open=False):
                         predictor_note = gr.Markdown()
                 with gr.Column(scale=2):
-                    render_overlay_btn = gr.Button(
-                        "Render preview of the ticked dancers (takes a while)", size="sm")
                     predicted_overlay = gr.Video(label="Preview: predicted dancers only",
                                                  elem_id="ddc_pred_video", visible=False)
                     tracks_plot = gr.Plot(label="When each person is visible")
@@ -595,6 +601,13 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
 
         with gr.Tab("3 · Results", id=TAB_RESULTS):
             result_title = gr.Markdown(NO_RESULT_HINT)
+            cmp_note = gr.Markdown()
+            summary_tbl = gr.Dataframe(
+                headers=["Dancer", "Similarity / 100", "Comparable frames", "Mean raw deviation",
+                         "Strength / closest region", "Area to review"],
+                interactive=False, label="Per-dancer coaching summary (heuristic scores)")
+            with gr.Accordion("How scores and feedback work", open=False):
+                gr.Markdown(SCORE_EXPLANATION)
             with gr.Row():
                 with gr.Column(scale=2, elem_id="ddc_video_col"):
                     cmp_video = gr.Video(label="Deviation overlay (green = close, red = far, "
@@ -610,17 +623,15 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                 moments_tbl = gr.Dataframe(
                     headers=["Dancer", "Time (s)", "Joint", "Deviation"], interactive=False,
                     label="Worst moments -- click a row to jump there", scale=3)
-            cmp_note = gr.Markdown()
-            with gr.Row():
-                summary_tbl = gr.Dataframe(
-                    headers=["Dancer", "Frames present", "Mean deviation", "Worst joint"],
-                    interactive=False, label="Per-dancer summary", scale=3)
-                csv_out = gr.File(label="Per-frame deviation CSV", scale=2)
+            feedback_tbl = gr.Dataframe(
+                headers=["Dancer", "Time (s)", "Suggestion"], interactive=False,
+                label="Personalized feedback — click a row to inspect (empty when no substantial differences)")
+            csv_out = gr.File(label="Per-frame deviation and movement similarity CSV")
 
     people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
                       predicted_overlay, predictor_note, people_headline, review_status, cmp_btn]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
-                      csv_out, detail]
+                      csv_out, detail, feedback_tbl]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
 
     demo.load(_runs_update, outputs=run_dd)
@@ -662,17 +673,18 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                    gr.update(visible=c == REF_SOLO), gr.update(visible=c == REF_COMPOSITE)),
         inputs=ref_choice, outputs=[ref_dancer, solo_video, solo_offset, loo_choice])
     save_review_btn.click(save_review, inputs=[active_run, track_select], outputs=review_status)
-    render_overlay_btn.click(run_render_overlay, inputs=[active_run, track_select],
-                             outputs=predicted_overlay, show_progress_on=predicted_overlay)
     cmp_btn.click(run_compare,
                   inputs=[active_run, track_select, loo_choice, rotate, smooth,
                           ref_choice, ref_dancer, solo_video, solo_offset],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
-                           cmp_note, csv_out, t_slider, detail, review_status],
+                           cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl],
                   show_progress_on=cmp_progress
                   ).success(lambda: None, js=_SCROLL_TOP_JS)
     t_slider.change(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
     moments_tbl.select(jump_to_moment, inputs=moments_tbl, outputs=t_slider
+    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+
+    feedback_tbl.select(jump_to_moment, inputs=feedback_tbl, outputs=t_slider
     ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
 

@@ -544,19 +544,12 @@ def _source_video(run_dir: Path, video_path: str | Path | None = None) -> Path:
 
 def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True,
                               video_path: str | Path | None = None,
-                              predictions: list[dict] | None = None, merge_groups=None,
-                              output: str | Path | None = None, max_height: int | None = None,
-                              progress=None) -> dict:
+                              predictions: list[dict] | None = None, merge_groups=None) -> dict:
     """Render an annotation-only dancer toggle from existing detections/predictions.
 
     The original video pixels are preserved.  Turning non-dancers off removes
     their skeleton, label, and JSON pose record; it does not inpaint people out
     of the camera footage.
-
-    ``output`` overrides the default file name in ``run_dir`` (the JSONL goes beside it);
-    ``max_height`` downscales frames before drawing, which makes the render and the
-    re-encode far cheaper on 4K footage; ``progress(fraction, desc)`` is called every so
-    often.  The JSONL always keeps the source's pixel coordinates.
     """
     import cv2
     from video_pipeline import _cfr_source, _reencode_h264, open_video
@@ -583,25 +576,18 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
         raise ValueError(f"could not open source video {source}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    scale = min(1.0, max_height / height) if max_height else 1.0
-    out_w, out_h = max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
-    sx, sy = out_w / width, out_h / height
     stem = "predicted_all_people" if show_non_dancers else "predicted_dancers_only"
-    overlay = Path(output) if output else run_dir / f"{stem}_overlay.mp4"
-    overlay.parent.mkdir(parents=True, exist_ok=True)
+    overlay = run_dir / f"{stem}_overlay.mp4"
     raw_overlay = overlay.with_suffix(".raw.mp4")
-    json_out = overlay.with_suffix(".jsonl") if output else run_dir / f"{stem}.jsonl"
-    writer = cv2.VideoWriter(str(raw_overlay), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
-    total = max(1, len(det.raw))
+    json_out = run_dir / f"{stem}.jsonl"
+    writer = cv2.VideoWriter(str(raw_overlay), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     colors = {"dancer": (45, 210, 80), "non_dancer": (70, 140, 255), "unclassified": (180, 180, 180)}
     try:
-        with json_out.open("w") as output_file:
+        with json_out.open("w") as output:
             for frame, (people, assigned) in enumerate(zip(det.raw, ids)):
                 ok, image = cap.read()
                 if not ok:
                     break
-                if (out_w, out_h) != (width, height):
-                    image = cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
                 kept = []
                 for person, tid in zip(people, assigned):
                     label = prediction_map.get(int(tid), "unclassified") if tid >= 0 else "unclassified"
@@ -616,18 +602,14 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
                     for a, b in EDGES:
                         pa, pb = kp.get(a), kp.get(b)
                         if pa and pb and pa[2] >= CONF_THR and pb[2] >= CONF_THR:
-                            cv2.line(image, (int(pa[0] * sx), int(pa[1] * sy)),
-                                     (int(pb[0] * sx), int(pb[1] * sy)), color, 2)
+                            cv2.line(image, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])), color, 2)
                     if person.get("bbox"):
-                        x0, y0, x1, y1 = person["bbox"]
-                        x0, x1, y0, y1 = int(x0 * sx), int(x1 * sx), int(y0 * sy), int(y1 * sy)
+                        x0, y0, x1, y1 = (int(v) for v in person["bbox"])
                         cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
                         cv2.putText(image, f"{label.replace('_', ' ')} #{tid}", (x0, max(20, y0 - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, .5, color, 2, cv2.LINE_AA)
-                output_file.write(json.dumps({"frame": frame, "t": float(det.t[frame]), "people": kept}) + "\n")
+                output.write(json.dumps({"frame": frame, "t": float(det.t[frame]), "people": kept}) + "\n")
                 writer.write(image)
-                if progress and frame % 50 == 0:
-                    progress(frame / total, f"Rendering overlay: frame {frame}/{total}")
     finally:
         cap.release(); writer.release(); source_context.__exit__(None, None, None)
     _reencode_h264(raw_overlay, overlay)
