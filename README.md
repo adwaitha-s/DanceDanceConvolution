@@ -195,8 +195,8 @@ python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
 
 In the web UI, this screening happens in step 2 (**Dancers**). Opening a run
 there scores every saved track with the five standardized
-predictors displayed in `runs/dancer_feature_registry.xlsx`, generates a
-dancer-only pose overlay, and pre-selects only the predicted dancers. It does
+predictors displayed in `runs/dancer_feature_registry.xlsx` and pre-selects only
+the predicted dancers. It does
 **not** run pose detection again. The action also adds a Labels-style worksheet
 for the run. Use **Save reviewed labels** beside the checklist after changing
 the review: it updates Reviewed label, Validation status, and Correction
@@ -205,6 +205,12 @@ recorded in that worksheet. Leaving the checklist unchanged and clicking
 review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
 the five predictors, followed by one labels sheet per run and one detailed
 sheet per validated dancer track.
+
+**Render preview of the ticked dancers** draws a video of just the ticked people. It re-encodes the
+whole clip, so it only runs when you click it, at up to 720p (using the hardware decoder and
+encoder on macOS). Renders are cached under `runs/<run>/overlays/`, keyed on the run, merges,
+ticked dancers and source video, so repeating a request is instant; the three newest are kept
+per run.
 
 Track ids come from `ddc.tracking.stable_track_ids` (automatic stitching plus any manual
 merges), the same numbering the step 2 people list shows. Merging people re-scores the
