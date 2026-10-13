@@ -552,7 +552,7 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
     of the camera footage.
     """
     import cv2
-    from video_pipeline import _cfr_source, _reencode_h264
+    from video_pipeline import _cfr_source, _reencode_h264, open_video
 
     run_dir = Path(run_dir)
     pred_path = run_dir / "dancer_predictions.csv"
@@ -570,7 +570,7 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
     # direct OpenCV reads can stop early or drift on variable-frame-rate clips.
     source_context = _cfr_source(str(source))
     normalized_source = source_context.__enter__()
-    cap = cv2.VideoCapture(str(normalized_source))
+    cap = open_video(normalized_source)
     if not cap.isOpened():
         source_context.__exit__(None, None, None)
         raise ValueError(f"could not open source video {source}")
