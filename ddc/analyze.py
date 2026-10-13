@@ -246,7 +246,7 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
         if any(t < 0 or t >= n_tracks for t in selected_tracks):
             raise ValueError(
                 f"selected track ids {sorted(selected_tracks)} don't match this run's "
-                f"{n_tracks} detected people -- click \"Find people\" again")
+                f"{n_tracks} detected people -- open the run again")
         dense = dense[:, sorted(selected_tracks)]
         n_tracks = len(selected_tracks)
     norm, origin, scale, rot = normalize(dense, rotate=rotate)
@@ -303,7 +303,8 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
         from .render import render_overlay
         bg, dim = _pick_background(run_dir, video_path)
         res.overlay_path = render_overlay(dense, dev, origin, scale, rot, det.t,
-                                          run_dir / "composite_overlay.mp4", bg, dim)
+                                          run_dir / "composite_overlay.mp4", bg, dim,
+                                          on_progress=on_progress)
     return res
 
 
