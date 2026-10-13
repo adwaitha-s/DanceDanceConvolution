@@ -28,7 +28,9 @@ def dev_color(d: float) -> tuple:
 
 def _frame_source(video_path, n_frames):
     """Yield BGR frames from video_path (dimmed if it is an overlay), else None forever."""
-    cap = cv2.VideoCapture(str(video_path)) if video_path else None
+    from video_pipeline import open_video
+
+    cap = open_video(video_path) if video_path else None
     try:
         for _ in range(n_frames):
             ok, fr = (cap.read() if cap is not None else (False, None))

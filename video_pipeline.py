@@ -18,6 +18,7 @@ import functools
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -113,24 +114,56 @@ def _cfr_input(fn):
     return wrapper
 
 
+@functools.lru_cache(maxsize=1)
+def _has_videotoolbox() -> bool:
+    if sys.platform != "darwin" or shutil.which("ffmpeg") is None:
+        return False
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    return "h264_videotoolbox" in out
+
+
+def open_video(video_path) -> cv2.VideoCapture:
+    """Open a video for sequential reading, hardware-decoded on macOS when safe.
+
+    OpenCV's default FFmpeg backend decodes in software on every core, which for
+    4K HEVC phone footage costs ~15x the CPU of AVFoundation's VideoToolbox
+    decode. AVFoundation is only used when it agrees with the FFmpeg backend on
+    frame size (it does not apply rotation metadata), and only for readers that
+    go front to back -- seeking stays on the default backend.
+    """
+    default = cv2.VideoCapture(str(video_path))
+    if sys.platform != "darwin" or not default.isOpened():
+        return default
+    hw = cv2.VideoCapture(str(video_path), cv2.CAP_AVFOUNDATION)
+    same_size = all(int(hw.get(prop)) == int(default.get(prop))
+                    for prop in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT))
+    if hw.isOpened() and same_size:
+        default.release()
+        return hw
+    hw.release()
+    return default
+
+
 def _reencode_h264(raw_path: Path, final_path: Path) -> Path:
     """Re-encode to H.264/yuv420p with ffmpeg so browsers can play it inline.
 
-    Falls back to the raw (mp4v) file if ffmpeg isn't available. `veryfast` was
-    picked over the (unset) libx264 default of `medium` because this re-encode
-    dominates render time for both the pose-tracking and composite overlays --
-    on a many-core machine `medium` can peg every core for a while, and this is
-    a preview/debug video rather than something delivered for distribution, so
-    the modest file-size increase is worth the large speedup.
+    Falls back to the raw (mp4v) file if ffmpeg isn't available. On macOS the
+    VideoToolbox hardware encoder is used: this re-encode dominates render time
+    for both the pose-tracking and composite overlays, and libx264 pegs every
+    core for it even at `veryfast` (~10x the CPU of the hardware encoder on 4K
+    footage). libx264 `veryfast` remains the fallback -- this is a preview/debug
+    video rather than something delivered for distribution.
     """
     if shutil.which("ffmpeg") is None:
         raw_path.replace(final_path)
         return final_path
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_path),
-         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(final_path)],
-        check=True,
-    )
+    base = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_path)]
+    tail = ["-pix_fmt", "yuv420p", str(final_path)]
+    done = False
+    if _has_videotoolbox():
+        done = subprocess.run(base + ["-c:v", "h264_videotoolbox", "-q:v", "55"] + tail).returncode == 0
+    if not done:
+        subprocess.run(base + ["-c:v", "libx264", "-preset", "veryfast"] + tail, check=True)
     raw_path.unlink()
     return final_path
 
