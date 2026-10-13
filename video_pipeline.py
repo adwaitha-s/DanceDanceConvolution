@@ -128,8 +128,16 @@ def open_video(video_path) -> cv2.VideoCapture:
     OpenCV's default FFmpeg backend decodes in software on every core, which for
     4K HEVC phone footage costs ~15x the CPU of AVFoundation's VideoToolbox
     decode. AVFoundation is only used when it agrees with the FFmpeg backend on
-    frame size (it does not apply rotation metadata), and only for readers that
-    go front to back -- seeking stays on the default backend.
+    frame size (it does not apply rotation metadata) and on frame rate, and only
+    for readers that go front to back -- seeking stays on the default backend.
+
+    The frame-rate check guards frame alignment: tracking data is indexed by the
+    FFmpeg backend's frames. On an iPhone HEVC clip whose stream starts with
+    decode-only frames (negative timestamps), AVFoundation returned one extra
+    leading frame, shifting every frame by one against the tracking data; that
+    clip was also the only one of six tested where the two backends reported
+    different frame rates (29.67 vs 29.99). The reported frame *counts* are not
+    usable for this -- they differ by 1-2 even on clips that align exactly.
     """
     default = cv2.VideoCapture(str(video_path))
     if sys.platform != "darwin" or not default.isOpened():
@@ -137,7 +145,9 @@ def open_video(video_path) -> cv2.VideoCapture:
     hw = cv2.VideoCapture(str(video_path), cv2.CAP_AVFOUNDATION)
     same_size = all(int(hw.get(prop)) == int(default.get(prop))
                     for prop in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT))
-    if hw.isOpened() and same_size:
+    fps = default.get(cv2.CAP_PROP_FPS)
+    same_rate = fps > 0 and abs(hw.get(cv2.CAP_PROP_FPS) - fps) <= 1e-3 * fps
+    if hw.isOpened() and same_size and same_rate:
         default.release()
         return hw
     hw.release()

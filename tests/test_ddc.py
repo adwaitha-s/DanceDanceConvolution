@@ -294,3 +294,35 @@ def test_detect_tracks_persists_uploaded_source_video(tmp_path):
 
     detect_tracks(run_dir, str(src))
     assert (run_dir / "source.mp4").exists()
+
+
+def test_open_video_uses_hardware_decode_only_when_size_and_rate_agree(monkeypatch):
+    import cv2
+
+    import video_pipeline
+
+    class FakeCapture:
+        hw_props = {}
+
+        def __init__(self, path, backend=None):
+            self.hw = backend == cv2.CAP_AVFOUNDATION
+            self.props = {cv2.CAP_PROP_FRAME_WIDTH: 3840, cv2.CAP_PROP_FRAME_HEIGHT: 2160,
+                          cv2.CAP_PROP_FPS: 29.67, **(self.hw_props if self.hw else {})}
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            return self.props[prop]
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(video_pipeline.sys, "platform", "darwin")
+    monkeypatch.setattr(video_pipeline.cv2, "VideoCapture", FakeCapture)
+
+    assert video_pipeline.open_video("clip.mov").hw
+    FakeCapture.hw_props = {cv2.CAP_PROP_FPS: 29.99}          # extra leading frame case
+    assert not video_pipeline.open_video("clip.mov").hw
+    FakeCapture.hw_props = {cv2.CAP_PROP_FRAME_WIDTH: 2160, cv2.CAP_PROP_FRAME_HEIGHT: 3840}
+    assert not video_pipeline.open_video("clip.mov").hw       # rotation metadata ignored
