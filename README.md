@@ -338,3 +338,50 @@ the clip (frames 667-786) -- consistent with the dancers leaving frame
 before the clip ends, not a detection dropout. In every frame where a person
 *was* detected, hands came through essentially every time (99.9%), a sharp
 contrast with MediaPipe's 15.3% hand coverage on comparable footage above.
+
+### Coaching dashboard (step 3)
+
+After **Compare dancers**, Results shows an overall movement-similarity score,
+per-dancer scores and comparable-frame coverage, the closest body region, and the
+joint/region to review. **Personalized feedback** lists up to three separated
+moments per dancer; click a row to seek the overlay. **Inspect time** gives joint
+feedback at any frame. The existing deviation timeline, worst moments and overlay
+remain available. The CSV retains its original columns (including `score`, the
+raw deviation) and appends `movement_similarity`, a per-frame heuristic score;
+blank similarity cells mean there was insufficient comparable data.
+
+**Formula:** for each eligible frame, average the existing joint distances in
+normalized torso lengths over comparable joints. Average those frame deviations
+for each dancer, then use `100 / (1 + mean_deviation)`. For example, deviations
+of 0, 0.25 and 1 torso length map to 100, 80 and 50. The overall score is the
+unweighted average of available dancer scores, excluding a reference dancer.
+It is not the average of per-frame scores because the mapping is nonlinear.
+
+A frame needs at least 6 of 17 reliable, comparable body joints. Low-confidence,
+nonfinite or missing joints are excluded. A composite joint needs a visible
+peer at the same joint in that frame, so a dancer never earns a perfect score
+by matching only themselves. A reference dancer is not scored and their
+unobserved joints are excluded even if smoothing filled a gap. Solo references
+use the existing interpolated/smoothed poses within their time overlap.
+No eligible data yields **N/A**, not zero or 100. Coverage is eligible frames
+out of all clip frames; low coverage may make scores misleadingly high.
+
+Suggestions use the same eligible joints. A joint difference below 0.15 torso
+lengths is described as close. Larger differences receive a review suggestion;
+"higher/lower" is used only for a vertical difference of at least 0.15 torso
+lengths that is at least 1.5 times its horizontal difference. Positive image y
+means lower. This describes height relative to the hips in the normalized 2D
+camera view, not depth or absolute screen position. Torso-rotation normalization
+disables directional wording. Horizontal/ambiguous differences receive neutral
+wording. Left/right joint names are the detector's anatomical labels. The 6-joint
+minimum and 0.15 tolerance are design heuristics defined in `ddc/coaching.py`.
+
+**Limitations:** this is a movement-similarity heuristic, not a scientifically
+validated accuracy percentage. Reference choice, smoothing, occlusion, camera
+perspective, tracking errors and video timing affect the result. Two dancers
+compared with their shared composite get symmetric differences; the system
+cannot tell which dancer is correct. The closest region is a relative strength,
+not proof of good technique. Scores do not evaluate rhythm, artistry or 3D form.
+No additional detector or language-model API calls are needed for coaching.
+
+Run regression tests with `python -m pytest tests -q` in your virtualenv.

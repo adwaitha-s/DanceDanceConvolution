@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from . import io as ddc_io
+from .coaching import Coaching, build_coaching
 from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
 from .reference import reference_from_solo, reference_from_track
@@ -186,6 +187,8 @@ class Result:
     summary: list          # per-dancer dicts
     overlay_path: str | None = None
     csv_path: str | None = None
+    coaching: Coaching | None = None
+    rotate: bool = False
 
 
 REFERENCE_MODES = ("composite", "dancer", "solo")
@@ -287,18 +290,21 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
             "worst_moments": [(round(tm, 1), round(sc, 2), BODY[j]) for tm, sc, j in moments[d]],
         })
 
+    coaching = build_coaching(dev, norm)
     csv_path = run_dir / "deviation.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["frame", "t", "dancer", "score"] + BODY)
+        w.writerow(["frame", "t", "dancer", "score"] + BODY + ["movement_similarity"])
         for fr in range(det.n_frames):
             for d in range(n_tracks):
                 if np.isfinite(dev.score[fr, d]):
                     w.writerow([fr, f"{det.t[fr]:.3f}", d + 1, f"{dev.score[fr, d]:.4f}"]
-                               + [f"{v:.4f}" if np.isfinite(v) else "" for v in dev.joint[fr, d]])
+                               + [f"{v:.4f}" if np.isfinite(v) else "" for v in dev.joint[fr, d]]
+                               + [f"{coaching.frame_score[fr, d]:.4f}"
+                                  if np.isfinite(coaching.frame_score[fr, d]) else ""])
 
     res = Result(run_dir, det.t, dense, norm, origin, scale, rot, dev, n_tracks, summary,
-                 csv_path=str(csv_path))
+                 csv_path=str(csv_path), coaching=coaching, rotate=rotate)
     if render:
         from .render import render_overlay
         bg, dim = _pick_background(run_dir, video_path)
