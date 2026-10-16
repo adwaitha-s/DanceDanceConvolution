@@ -25,9 +25,11 @@ import numpy as np
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
 from ddc.overlay_cache import render_dancer_overlay
 from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
-                                  validate_checklist)
+                                  validate_checklist, load_merges, review_is_current)
+from ddc.dancer_features import load_labels
 from ddc.plots import timeline_figure, tracks_figure
 from ddc.skeleton import BODY
+from ddc.training import register_run, refresh_after_review, record_screening
 from video_pipeline import analyze_video_mediapipe, analyze_video_rtmw, analyze_video_yolo
 
 MODEL_YOLO = "YOLO (body only, fast)"
@@ -136,11 +138,16 @@ def run_analysis(video_path: str, model_choice: str, track: bool, num_people: in
 
     progress(0, desc="Preparing video...")
     run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists():
+        run_dir = RUNS_DIR / f"{run_dir.name}-{time.time_ns()}"
+    run_dir.mkdir(parents=True, exist_ok=False)
     out_jsonl = run_dir / "tracking.jsonl"
     out_video = run_dir / "overlay.mp4"
 
-    on_progress = _frame_progress(progress, 0.02, 0.95, "Tracking poses")
+    model_name = {MODEL_YOLO: "YOLO", MODEL_RTMW: "RTMW",
+                  MODEL_MEDIAPIPE: "MediaPipe"}.get(model_choice, "MediaPipe")
+    progress(0.02, desc=f"Loading {model_name} pose model...")
+    on_progress = _frame_progress(progress, 0.02, 0.95, f"Analyzing {model_name} poses")
     if model_choice == MODEL_YOLO:
         summary = analyze_video_yolo(video_path, str(out_jsonl), str(out_video), track=track,
                                      on_progress=on_progress)
@@ -165,6 +172,11 @@ def run_analysis(video_path: str, model_choice: str, track: bool, num_people: in
 
     note = (f"Tracked **{summary['frames']} frames** ({duration:.1f} s), up to "
             f"**{summary['max_people_detected']} people** in a frame.")
+    cohort = register_run(RUNS_DIR, run_dir.name)
+    if cohort and run_dir.name in cohort["runs"]:
+        progress(0.98, desc="Updating training registry...")
+        note += refresh_after_review(RUNS_DIR)
+    progress(1, desc="Pose analysis complete")
     if model_choice == MODEL_MEDIAPIPE:
         note += (" MediaPipe output is tracking-only: use the files below, or analyze with "
                  "RTMW or YOLO to compare dancers.")
@@ -198,6 +210,7 @@ def _predict_people(run_name, groups, tracks):
         # A first-ever run cannot be predicted until both classes have two human
         # labels.  Keep the manual fallback explicit rather than silently training.
         _LAST["predictions"] = []
+        record_screening(RUNS_DIR, run_name, [], groups)
         return (labels,
                 f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
 
@@ -207,6 +220,7 @@ def _predict_people(run_name, groups, tracks):
     _LAST["predictions"] = predictions
     _LAST["model"] = model
     _LAST["predicted_selected_ids"] = predicted_ids
+    record_screening(RUNS_DIR, run_name, predictions, groups)
 
     # The workbook is a convenience: a failure must not discard the predictions above.
     # The preview video is NOT rendered here -- it re-encodes the whole clip and takes
@@ -218,6 +232,7 @@ def _predict_people(run_name, groups, tracks):
         rebuild_registry_workbook(RUNS_DIR)
     except RuntimeError as e:
         problems.append(f"Registry workbook refresh needs attention: {e}")
+    training_note = refresh_after_review(RUNS_DIR)
 
     weights = "; ".join(f"{item['feature_name']}: {item['standardized_coefficient']:+.3f}"
                         for item in model["selected_features"])
@@ -225,8 +240,8 @@ def _predict_people(run_name, groups, tracks):
             f"{model['labelled_tracks']} validated track labels across {len(model['runs'])} run(s) "
             f"(this run is held out of training). "
             f"The checklist uses exactly these five standardized weights: {weights}. "
-            "Leave it unchanged and Compare to validate every prediction, or save edits to record corrections. "
-            + " ".join(problems))
+            "Compare confirms the original predictions unless you first Save reviewed labels. "
+            "Save records checklist corrections. " + " ".join(problems) + training_note)
     return selected, note.strip()
 
 
@@ -238,6 +253,10 @@ def _review_status(track_choice) -> str:
     current = frozenset(ids[c] for c in (track_choice or []) if c in ids)
     if _LAST.get("saved_selection") == current:
         return "✅ Labels saved."
+    if _LAST.get("predictions") and "saved_selection" not in _LAST:
+        return ("Matches the automatic selection -- Compare confirms all predictions."
+                if current == _LAST.get("predicted_selected_ids") else
+                "🟠 **Unsaved changes** -- Save records edits; Compare confirms the original predictions.")
     if _LAST.get("predictions") and current == _LAST.get("predicted_selected_ids"):
         return "Matches the automatic selection -- it is confirmed when you compare."
     if not _LAST.get("predictions") and "saved_selection" not in _LAST:
@@ -265,6 +284,18 @@ def _show_people(run_name, groups, progress=None):
     if progress is not None:
         progress(0.5, desc="Predicting dancers...")
     selected, note = _predict_people(run_name, groups, tracks)
+    # Reopening a reviewed run must not let Compare overwrite saved corrections.
+    folder = RUNS_DIR / run_name
+    if ((folder / "labels.csv").exists() and load_merges(folder) == (groups or [])
+            and review_is_current(folder)):
+        saved = load_labels(folder / "labels.csv")
+        if set(saved) == set(_LAST["track_ids"].values()):
+            _LAST["saved_selection"] = frozenset(tid for tid, label in saved.items() if label)
+            validation_path = folder / "prediction_validation.json"
+            _LAST["saved_validation"] = json.loads(validation_path.read_text()) if validation_path.exists() else {}
+            selected = [label for label in labels if _LAST["track_ids"][label] in _LAST["saved_selection"]]
+    elif (folder / "labels.csv").exists() and not review_is_current(folder):
+        note += " Tracking identities changed; review and save this run's dancer labels again."
     if _LAST.get("predictions"):
         headline = (f"**{len(selected)} of {len(labels)} people** were automatically selected as "
                     "dancers. Untick anyone who isn't dancing, tick anyone who was missed.")
@@ -373,7 +404,7 @@ def save_review(run_name, track_choice, progress=gr.Progress()):
                                      merge_groups=_LAST.get("merges"))
         _LAST["saved_selection"] = frozenset(selected)
         _LAST["saved_validation"] = outcome["validation"]
-        workbook = rebuild_registry_workbook(RUNS_DIR)
+        workbook_note = outcome.get("registry_note", "")
     except (RuntimeError, ValueError) as e:
         raise gr.Error(f"Could not save the reviewed checklist: {e}")
     progress(1, desc="Reviewed labels saved")
@@ -381,16 +412,44 @@ def save_review(run_name, track_choice, progress=gr.Progress()):
     state = validation["status"].replace("_", " ")
     return (f"✅ **Labels saved.** Predictor labels {state}; "
             f"{len(validation['corrected_track_ids'])} track correction(s) recorded. "
-            f"Updated {workbook.name}.")
+            f"{workbook_note}{outcome.get('training_note', '')}")
+
+
+def _validate_comparison(run_name, selected):
+    """Compare confirms predictions only when no saved review already exists."""
+    current = frozenset(selected)
+    if "saved_selection" in _LAST:
+        if current != _LAST["saved_selection"]:
+            return " Saved validation labels retained. Unsaved checklist edits were not recorded."
+        validation = _LAST.get("saved_validation", {})
+        return (f" Saved validation labels retained; "
+                f"{len(validation.get('corrected_track_ids', []))} recorded correction(s).")
+    predictions = _LAST.get("predictions", [])
+    if not predictions:
+        return " No predictor labels are available yet. Use Save reviewed labels to record the manual checklist."
+    baseline = [p["track_id"] for p in predictions if p["predicted_label"] == "dancer"]
+    try:
+        outcome = validate_checklist(RUNS_DIR, run_name, baseline, predictions,
+                                     merge_groups=_LAST.get("merges"), review_action="compare_confirmed")
+        _LAST["saved_selection"] = frozenset(baseline)
+        _LAST["saved_validation"] = outcome["validation"]
+        note = " Predictor labels validated all correct; 0 corrections."
+        if current != frozenset(baseline):
+            note += " Unsaved checklist edits were not recorded."
+        return note + outcome.get("registry_note", "") + outcome.get("training_note", "")
+    except (RuntimeError, ValueError) as exc:
+        return f" Checklist validation could not be saved: {exc}"
 
 
 @_friendly("Comparison")
 def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
                 ref_choice, ref_dancer, solo_video, solo_offset, progress=gr.Progress()):
     _require_people(run_name)
+    progress(0.02, desc="Updating validation labels...")
+    selected = [_LAST["track_ids"][c] for c in (track_choice or [])]
+    validation_note = _validate_comparison(run_name, selected)
     if not track_choice:
-        raise gr.Error("Select at least one person as a dancer.")
-    selected = [_LAST["track_ids"][c] for c in track_choice]
+        raise gr.Error("Select at least one person as a dancer to compare." + validation_note)
     loo = {"Auto (on for 3+ dancers)": None, "On": True, "Off": False}[loo_choice]
     mode = REF_MODES[ref_choice]
     ref_idx = None
@@ -413,31 +472,6 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     except ValueError as e:
         raise gr.Error(str(e))
     _LAST["res"] = res
-    validation_note = ""
-    if _LAST.get("predictions"):
-        baseline = _LAST.get("predicted_selected_ids", frozenset())
-        current = frozenset(selected)
-        if current == baseline:
-            # An untouched checklist is the explicit all-correct confirmation.
-            # Save it here so a reviewer can validate straight from Compare.
-            try:
-                outcome = validate_checklist(RUNS_DIR, run_name, selected, _LAST["predictions"],
-                                             merge_groups=_LAST.get("merges"))
-                _LAST["saved_selection"] = current
-                _LAST["saved_validation"] = outcome["validation"]
-                workbook = rebuild_registry_workbook(RUNS_DIR)
-                validation_note = (" Predictor labels validated correct; 0 track corrections stored. "
-                                   f"Accumulating workbook updated: {workbook.name}.")
-            except (RuntimeError, ValueError) as e:
-                validation_note = f" Checklist validation could not be saved: {e}"
-        elif _LAST.get("saved_selection") != current:
-            validation_note = (" Checklist changes have not been saved. Click **Save reviewed labels** "
-                               "in step 2 to update the registry's Reviewed label, Validation status, and "
-                               "Correction recorded columns.")
-        else:
-            validation = _LAST.get("saved_validation", {})
-            validation_note = (f" Reviewed corrections are saved: "
-                               f"{len(validation.get('corrected_track_ids', []))} track correction(s).")
     progress(0.97, desc="Plotting...")
 
     # Dancers are renumbered 1..N among the ticked people, so say who is who whenever
@@ -525,6 +559,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                             label="Number of people in video (MediaPipe only -- YOLO/RTMW have no cap)",
                         )
                     run_btn = gr.Button("Analyze video", variant="primary")
+                    analysis_progress = gr.Markdown(min_height=48, elem_id="ddc_pose_progress")
                     analysis_note = gr.Markdown()
                 with gr.Column(scale=2):
                     gr.Markdown("**Or open a video you already analyzed**")
@@ -636,7 +671,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
         run_analysis,
         inputs=[video_in, model_choice, track, num_people],
         outputs=[video_out, json_out, analysis_note, run_dd, active_run],
-        show_progress_on=analysis_note,
+        show_progress="full",
+        show_progress_on=analysis_progress,
     ).success(begin_review, inputs=active_run, outputs=review_reset_outputs,
               show_progress="hidden",
               js=_SCROLL_TOP_JS_KEEP

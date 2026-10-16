@@ -21,7 +21,7 @@ import numpy as np
 from . import io as ddc_io
 from .dancer_features import CONF_THR, J, load_labels
 from .skeleton import BODY, EDGES
-from .tracking import stable_track_ids, to_dense
+from .tracking import TRACKING_VERSION, stable_track_ids, to_dense, tracking_stamp
 
 
 @dataclass(frozen=True)
@@ -509,6 +509,8 @@ def write_inventory_artifacts(tracking_jsonl: str | Path, labels_csv: str | Path
     report, predictions = embedded_selection(rows, load_labels(labels_csv))
     catalog = [spec.__dict__ for spec in FEATURE_SPECS]
     payload = {"source_tracking_jsonl": str(tracking_jsonl), "merge_groups": normalize_merges(merge_groups),
+               "tracking_version": TRACKING_VERSION,
+               "tracking_stamp": tracking_stamp(tracking_jsonl),
                "catalog": catalog, "tracks": rows,
                "selection": report, "predictions": predictions}
     inventory_json = out_dir / "feature_inventory.json"

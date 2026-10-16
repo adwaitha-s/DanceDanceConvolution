@@ -12,6 +12,35 @@ def _make_run(root, name, *, labels):
     return run
 
 
+def test_legacy_track_reviews_are_not_attached_to_new_identities(tmp_path):
+    from ddc.feature_registry import _training_records, load_merges, review_is_current
+    from ddc.tracking import TRACKING_VERSION, tracking_stamp
+    run = _make_run(tmp_path, "reviewed", labels=True)
+    validation = run / "prediction_validation.json"
+    validation.write_text(json.dumps({"status": "validated_correct"}))
+    (run / "merges.json").write_text(json.dumps([[0, 1]]))
+    assert not review_is_current(run)
+    assert load_merges(run) == []
+    assert _training_records(tmp_path) == []
+    (run / "merges.json").write_text("[]")
+    validation.write_text(json.dumps({"tracking_version": TRACKING_VERSION,
+                                      "tracking_stamp": tracking_stamp(run / "tracking.jsonl")}))
+    assert review_is_current(run)
+    assert len(_training_records(tmp_path)) == 8
+
+
+def test_old_feature_inventory_is_recomputed_after_tracker_changes(tmp_path, monkeypatch):
+    import ddc.feature_registry as registry
+    from ddc.tracking import TRACKING_VERSION
+    run = _make_run(tmp_path, "cached", labels=True)
+    inventory = run / "feature_inventory.json"
+    inventory.write_text(json.dumps({"merge_groups": [], "tracks": [{"track_id": 99}],
+                                     "tracking_version": TRACKING_VERSION - 1}))
+    fresh = [{"track_id": 0}]
+    monkeypatch.setattr(registry, "collect_feature_inventory", lambda *args: fresh)
+    assert registry._load_run_rows(run) == fresh
+
+
 def test_registry_scores_with_only_the_workbook_top_five_features(tmp_path):
     _make_run(tmp_path, "training", labels=True)
     _make_run(tmp_path, "candidate", labels=False)
@@ -80,7 +109,7 @@ def test_camera_context_features_are_never_predictors(tmp_path):
     assert not [f for f in model["feature_ids"] if f.startswith("context_")]
 
 
-def test_workbook_is_written_with_summary_labels_and_dancer_sheets(tmp_path):
+def test_workbook_keeps_summary_and_labels_without_individual_dancer_statistics(tmp_path):
     from openpyxl import load_workbook
     from ddc.feature_registry import rebuild_registry_workbook
     _make_run(tmp_path, "training", labels=True)
@@ -91,7 +120,9 @@ def test_workbook_is_written_with_summary_labels_and_dancer_sheets(tmp_path):
     wb = load_workbook(path)
     assert wb.sheetnames[:3] == ["Registry Summary", "Feature Inventory Summary", "Feature Catalog"]
     assert "Labels-training" in wb.sheetnames and "Labels-candidate" in wb.sheetnames
-    assert any(name.startswith("D1-training") for name in wb.sheetnames)
+    assert len(wb.sheetnames) == 5
+    model = json.loads((tmp_path / "feature_model_registry.json").read_text())
+    assert all("top_predictors" not in track for run in model["runs_detail"] for track in run["tracks"])
     summary = wb["Registry Summary"]
     assert [summary.cell(row=r, column=2).value for r in range(11, 16)]  # five predictors
     assert wb["Labels-training"]["A5"].value == 0

@@ -12,7 +12,6 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 NAVY, TEAL, PALE, LINE = "17365D", "0F766E", "E8F1FA", "D6E2F0"
 _thin = Side(style="thin", color=LINE)
@@ -166,7 +165,7 @@ def write_registry_workbook(model: dict, path: str | Path) -> Path:
     cat.freeze_panes = "A5"
     _widths(cat, {"A": 31, "B": 26, "C": 28, "D": 52, "E": 24, "F": 33, "G": 18, "H": 36, "I": 14})
 
-    # --- One Labels sheet per run, one detail sheet per validated dancer --
+    # --- One Labels sheet per run; no individual dancer statistics are saved --
     for run in model["runs_detail"]:
         validation = run["validation"]
         status = validation.get("status") or ("historical_labels" if run["labelled_track_count"]
@@ -192,25 +191,6 @@ def write_registry_workbook(model: dict, path: str | Path) -> Path:
         sheet.freeze_panes = "A5"
         _widths(sheet, {"A": 13, "B": 16, "C": 18, "D": 18, "E": 20, "F": 18, "G": 18,
                         "I": 33, "J": 18, "K": 18, "L": 22})
-
-        for track in (t for t in run["tracks"] if t.get("reviewed_label") == "dancer"):
-            d = wb.create_sheet(_sheet_name(wb, f"D{track['track_id'] + 1}-{run['run']}"))
-            _title(d, f"Run {run['run']} — dancer track {track['track_id'] + 1}",
-                   f"Validated dancer. Model probability: {track['dancer_probability'] * 100:.1f}%. "
-                   "Top five global predictors are shown with this track's contribution.")
-            _label_pairs(d, 4, [("Frames present", track["frames_present"]),
-                                ("Predicted probability", track["dancer_probability"]),
-                                ("Predicted label", track["predicted_label"]),
-                                ("Validated label", track["reviewed_label"])])
-            d["B5"].number_format = "0.0%"
-            _header(d, 9, 1, ["Rank", "Predictor", "Category", "Raw value", "Std. value",
-                              "Std. coefficient", "Track logit contribution"])
-            _rows(d, 10, 1, [[p["rank"], p["feature_name"], p["category"], p["raw_value"],
-                              p["standardized_value"], p["standardized_coefficient"],
-                              p["logit_contribution"]] for p in track["top_predictors"]],
-                  {i: "0.000" for i in range(3, 7)})
-            d.freeze_panes = "A10"
-            _widths(d, {get_column_letter(i): 20 for i in range(1, 8)} | {"B": 32, "C": 30})
 
     wb.save(path)
     return path

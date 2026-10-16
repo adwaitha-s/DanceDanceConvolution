@@ -83,16 +83,22 @@ to call them directly from a script instead of the UI.
 
 ### One person, one track (step 2)
 
-The frame-to-frame tracker forgets someone after ~0.3 s, so occlusions and detection
-dropouts used to come back as new "people". `ddc.tracking.stabilize` now joins those
-fragments afterwards (`stitch_tracklets`): fragments that never appear in the same
-frame and line up in position, size and motion across the gap (up to 5 s) become one
-person, *before* short tracks are discarded. On a 5-dancer clip this took 19 raw
-tracks to exactly 5. Step 2 shows a "when each person is visible"
-timeline and how many fragments were joined into each person.
+RTMW's overlay draws detections independently in each frame; its detection indices
+are not persistent identities. `ddc.tracking.stable_track_ids` associates people
+using predicted torso motion, body size and clothing-color histograms from the saved
+source video. Arm movements have little influence on identity. Pose-only JSONL files
+fall back to motion and geometry; explicitly marked YOLO tracker IDs are preserved.
+Clothing descriptors are used only for association, never as dancer-classifier inputs.
 
-Geometry only (no appearance model), so people who cross paths or re-enter near each
-other can still be mixed up or left split. Under "Same person listed twice? Merge" in
+After a detection dropout, compatible fragments up to 5 s apart are joined before
+short tracks are discarded. Tracks with overlapping time spans are never stitched
+together. Step 2 shows a visibility timeline and the number of joined fragments.
+Track assignments are shared by the people list, features, previews and comparison.
+Old cached results are invalidated when tracking changes; saved UI labels need a new
+review because the person numbers may change.
+
+People wearing similar clothes can still be mixed up or left split after prolonged
+occlusion. Under "Same person listed twice? Merge" in
 step 2, tick the duplicates and click Merge (Reset merges undoes it); on the
 CLI use `--list-tracks` then `--merge 2,5` (repeatable).
 
@@ -193,6 +199,109 @@ python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
 
 ## Screen non-dancers before composite-pose analysis
 
+### Next ten videos: supervised training cohort
+
+The next-ten-video cohort is armed in this workspace. Restart the app to load
+the current controls. Each successful new **Analyze video** run is retained
+with its source, tracking data and a training-run marker. Reopening a run does
+not consume another slot. Capture stops at ten runs and persists across restarts.
+To arm this workflow in a fresh checkout, run:
+
+```powershell
+python -m ddc.training arm
+```
+
+`runs/training_registry.xlsx` contains exactly **40 candidate features**:
+10 time, 8 frequency, 8 time-frequency, 9 biomechanics and 5 human-related
+fields. Human-related fields describe external participant reports or the
+reviewed target; demographics, health and exertion are not estimated from
+video or used as skeleton predictors. The broader legacy feature registry is
+retained separately.
+
+Statistics update as each completed run enters the folder, up to ten runs.
+Saving or confirming labels in Dancers updates both `training_registry.xlsx`
+and `dancer_feature_registry.xlsx` in the same action. The Video tab has no
+training dropdown or separate refresh button. CLI `refresh` also discovers
+completed run folders and omits folders that have been removed. Older folders present when the cohort was
+armed and incomplete analyses are excluded. Pose features and preprocessed
+sequences are cached so a label change does not rerun pose detection.
+
+In **Dancers**, **Save reviewed labels** writes the current checklist to the
+registry's **Validation label** column and refits from the updated labels.
+If **Compare dancers** is pressed before a review has been saved, it confirms
+the original displayed predictions as all correct, with zero corrections.
+Unsaved checklist edits are not stored by Compare. A saved review always
+takes precedence, including after reopening the run. When no model prediction
+is available, Save is required to supply manual labels; Compare does not
+invent predictions.
+
+The training workbook is saved in `runs/training_registry.xlsx`. Labels are
+normally reviewed in Dancers; an edited workbook can also be imported with
+the CLI command below. Blank labels remain unreviewed. The registry includes per-run feature
+statistics, per-track selected predictor values and contributions, and
+prediction scores. Predictions become supervised labels only through an
+explicit Save or Compare confirmation, or an imported label review. Predictions
+shown in Dancers are preserved beside their validation labels after refitting.
+
+LASSO here means squared-error L1 regression with dancer=1 and non_dancer=0,
+not the legacy L1 logistic screener. Median imputation and standardization are
+fit within video-group cross-validation folds while tuning alpha. The five
+largest nonzero standardized coefficients determine the selected predictors;
+a five-input LASSO model is then fit. If the data cannot support five nonzero
+predictors, the pipeline reports that rather than filling the list with zero
+weights. Per-run predictions tune and train on **other enrolled runs only**.
+Its linear score is not a calibrated dancer probability. Selection CV MSE is
+used for alpha tuning and is not an independent performance estimate.
+
+LASSO and supervised PyTorch LSTM training are **rolling**: as soon as enough
+reviewed data supports the five predictors, the LSTM fits all currently reviewed,
+usable sequences. Every newly reviewed video or changed validation label triggers
+a new fit. Unreviewed clips still contribute feature statistics and await labels;
+they do not stop training on usable reviewed clips. Once all ten videos are
+reviewed and usable, all ten contribute to the model.
+Its inputs are the clip's middle five seconds: 17 body joints, hip-centered
+and torso-scaled xy, plus 17 visibility masks, resampled to 100 frames at
+20 Hz. Pixels, backgrounds, audio, demographic fields and reviewed labels do
+not enter the input tensor. The five LASSO features are recorded with the model
+as predictor-selection results; the LSTM receives the skeleton sequence itself.
+Interpolation is limited to 0.25-second gaps. Tracks with less than 50% visible
+joint coverage in the center window and clips shorter than five seconds are
+flagged and excluded from the rolling fit until replaced or made usable.
+The workbook lists these outstanding inputs. YOLO, RTMW and MediaPipe body schemas are supported;
+MediaPipe reviews use the workbook because its UI comparison remains unavailable.
+
+Outputs under `runs/training/` are `lasso_model.json`, `skeleton_lstm.pt`,
+`supervised_skeleton_sequences.npz` and `lstm_report.json`. Each enrolled run
+also retains `training/middle_5s_skeleton.npz` and preprocessing metadata.
+Changing labels or merges invalidates the previous fit. The checkpoint report
+explicitly identifies the current training inputs; training loss is not test
+accuracy. Ten clips may contain repeated people, and no independent test-set
+accuracy is claimed.
+
+CLI equivalents:
+
+```powershell
+python -m ddc.training status
+python -m ddc.training import-review --workbook edited_registry.xlsx
+python -m ddc.training refresh --no-train
+python -m ddc.training refresh --epochs 60
+python -m ddc.training replace-run --run RUN_NAME
+```
+
+`replace-run` retains the original files and frees a slot for the next successful
+analysis, useful for a short or unusable clip. Review the regenerated workbook
+after replacing a run or merging tracks. `--runs-dir` and `DDC_RUNS_DIR` select
+the run directory.
+
+Excel export uses Node.js with `@oai/artifact-tool`, automatically located in
+the Codex bundled runtime on this machine. Elsewhere, supply `DDC_NODE` and
+`DDC_ARTIFACT_MODULE_ROOT` (a node_modules directory containing that package).
+Python dependencies are in `requirements.txt`. Workbook export failures leave
+saved video data, labels and model outputs intact and are reported in the UI.
+Method references: [scikit-learn LASSO](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Lasso.html),
+[grouped cross-validation](https://scikit-learn.org/stable/modules/cross_validation.html),
+[PyTorch LSTM](https://docs.pytorch.org/docs/stable/generated/torch.nn.LSTM.html).
+
 In the web UI, this screening happens in step 2 (**Dancers**). Opening a run
 there scores every saved track with the five standardized
 predictors displayed in `runs/dancer_feature_registry.xlsx` and pre-selects only
@@ -200,11 +309,14 @@ the predicted dancers. It does
 **not** run pose detection again. The action also adds a Labels-style worksheet
 for the run. Use **Save reviewed labels** beside the checklist after changing
 the review: it updates Reviewed label, Validation status, and Correction
-recorded in that worksheet. Leaving the checklist unchanged and clicking
-**Compare** records the predictor labels as validated correct. Every saved
-review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
-the five predictors, followed by one labels sheet per run and one detailed
-sheet per validated dancer track.
+recorded in that worksheet. Clicking **Compare** before saving a review
+records the original predictor labels as validated correct, ignoring unsaved
+checklist edits. Once a review is saved, Compare preserves its labels. Every saved
+review rebuilds both registries. `runs/dancer_feature_registry.xlsx` retains
+predictor summaries, the feature catalog and one labels sheet per run.
+Individual-dancer statistics worksheets and their registry payloads are no
+longer saved. Pose features and supervised skeleton sequences remain in the
+training pipeline for model fitting.
 
 **Render preview of the ticked dancers** draws a video of just the ticked people. It re-encodes the
 whole clip, so it only runs when you click it, at up to 720p (using the hardware decoder and
@@ -250,7 +362,9 @@ Each line of the output file is one JSON object:
 `right_elbow`, `left_wrist`, `right_wrist`, `left_hip`, `right_hip`,
 `left_knee`, `right_knee`, `left_ankle`, `right_ankle`), each as
 `[x_pixels, y_pixels, confidence]`. `id` is a stable per-person track ID when
-run with `--track`, otherwise a per-frame detection index.
+run with `--track`, otherwise a per-frame detection index. The frame's `id_type`
+field explicitly distinguishes `"track"` from `"detection"`; older files without
+this field use geometric association rather than trusting ambiguous raw IDs.
 
 See [`examples/example_consumer.py`](examples/example_consumer.py) for a
 minimal reader that consumes the stream from a file or via stdin.

@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from .dancer_features import load_labels
+from .tracking import TRACKING_VERSION, tracking_stamp
 from .feature_inventory import (ELIGIBLE_FEATURE_IDS, FEATURE_SPECS, SPEC_BY_ID, _fit_l1,
                                 collect_feature_inventory, normalize_merges,
                                 write_inventory_artifacts)
@@ -33,9 +34,34 @@ def _run_directories(runs_dir: Path) -> list[Path]:
 def load_merges(run_dir: Path) -> list[list[int]]:
     """Manual track merges saved with a run's labels (empty if none)."""
     try:
+        validation = run_dir / "prediction_validation.json"
+        if validation.exists():
+            saved = json.loads(validation.read_text(encoding="utf-8"))
+            if (saved.get("tracking_version") != TRACKING_VERSION
+                    or saved.get("tracking_stamp") != tracking_stamp(run_dir / "tracking.jsonl")):
+                return []  # The old person numbers no longer identify these tracks.
         return normalize_merges(json.loads((run_dir / "merges.json").read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
         return []
+
+
+def review_is_current(run_dir: Path) -> bool:
+    """Saved checklist ids are meaningful only under the tracker that created them."""
+    run_dir = Path(run_dir)
+    review = run_dir / "training_review.json"
+    validation = run_dir / "prediction_validation.json"
+    try:
+        if review.exists():
+            from .training import signature
+            return json.loads(review.read_text(encoding="utf-8")).get("signature") == signature(run_dir)
+        if validation.exists():
+            saved = json.loads(validation.read_text(encoding="utf-8"))
+            return (saved.get("tracking_version") == TRACKING_VERSION
+                    and saved.get("tracking_stamp") == tracking_stamp(run_dir / "tracking.jsonl"))
+    except (OSError, ValueError, TypeError):
+        return False
+    # Hand-authored label CSVs have no saved UI identity state.
+    return True
 
 
 def _load_run_rows(run_dir: Path, merge_groups=None) -> list[dict]:
@@ -50,7 +76,9 @@ def _load_run_rows(run_dir: Path, merge_groups=None) -> list[dict]:
     if inventory.exists() and merge_groups is None:
         try:
             payload = json.loads(inventory.read_text(encoding="utf-8"))
-            if normalize_merges(payload.get("merge_groups")) == merges:
+            if (payload.get("tracking_version") == TRACKING_VERSION
+                    and payload.get("tracking_stamp") == tracking_stamp(run_dir / "tracking.jsonl")
+                    and normalize_merges(payload.get("merge_groups")) == merges):
                 return payload["tracks"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -63,7 +91,7 @@ def _training_records(runs_dir: Path, exclude_run: str | None = None) -> list[di
         if run_dir.name == exclude_run:
             continue
         label_path = run_dir / "labels.csv"
-        if not label_path.exists():
+        if not label_path.exists() or not review_is_current(run_dir):
             continue
         try:
             labels = load_labels(label_path)
@@ -178,10 +206,11 @@ def build_registry(runs_dir: str | Path, n_features: int = 5) -> dict:
     runs = []
     for run_dir in _run_directories(runs_dir):
         label_path = run_dir / "labels.csv"
-        labels = load_labels(label_path) if label_path.exists() else {}
+        current = review_is_current(run_dir)
+        labels = load_labels(label_path) if label_path.exists() and current else {}
         validation_path = run_dir / "prediction_validation.json"
         validation = {}
-        if validation_path.exists():
+        if validation_path.exists() and current:
             try:
                 validation = json.loads(validation_path.read_text(encoding="utf-8"))
             except ValueError:
@@ -190,6 +219,8 @@ def build_registry(runs_dir: str | Path, n_features: int = 5) -> dict:
         local_records = []
         for row in _load_run_rows(run_dir):
             scored = _score_row(row, model)
+            # The registry retains labels/probabilities, not individual predictor statistics.
+            scored.pop("top_predictors", None)
             # Preserve the prediction shown to the reviewer. Once a reviewed
             # run joins training data, a refit can change its in-sample score;
             # that must not rewrite the label that was originally validated.
@@ -249,7 +280,7 @@ def predict_run(runs_dir: str | Path, run_name: str,
 
 
 def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: list[int],
-                       predicted: list[dict], merge_groups=None) -> dict:
+                       predicted: list[dict], merge_groups=None, review_action="saved_review") -> dict:
     """Persist a completed checklist as training labels and rebuild the registry payload.
 
     ``merge_groups`` are the manual merges the checklist's track ids were numbered under.
@@ -258,7 +289,7 @@ def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: 
     runs_dir, run_dir = Path(runs_dir), Path(runs_dir) / run_name
     merges = normalize_merges(merge_groups)
     (run_dir / "merges.json").write_text(json.dumps(merges), encoding="utf-8")
-    all_ids = {int(row["track_id"]) for row in _load_run_rows(run_dir)}
+    all_ids = {int(row["track_id"]) for row in _load_run_rows(run_dir, merges)}
     selected = {int(item) for item in selected_track_ids}
     if not selected.issubset(all_ids):
         raise ValueError("checklist contains an unknown track")
@@ -272,6 +303,9 @@ def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: 
         writer.writerows({"track_id": tid, "label": "dancer" if tid in selected else "non_dancer"}
                          for tid in sorted(all_ids))
     validation = {"run": run_name, "validated_at": datetime.now(timezone.utc).isoformat(),
+                  "tracking_version": TRACKING_VERSION,
+                  "tracking_stamp": tracking_stamp(run_dir / "tracking.jsonl"),
+                  "review_action": review_action,
                   "status": ("validated_correct" if not corrections else "corrected")
                   if prediction_map else "reviewed_without_prediction",
                   "checked_dancer_tracks": sorted(selected), "corrected_track_ids": corrections,
@@ -283,8 +317,28 @@ def validate_checklist(runs_dir: str | Path, run_name: str, selected_track_ids: 
     (run_dir / "prediction_validation.json").write_text(json.dumps(validation, indent=2), encoding="utf-8")
     # Keep the run-local inventory compatible with the original embedded report.
     write_inventory_artifacts(run_dir / "tracking.jsonl", run_dir / "labels.csv", run_dir, merges)
-    model = build_registry(runs_dir)
-    return {"validation": validation, "model": model}
+    from .training import refresh_after_review, signature, _write
+    _write(run_dir / "training_review.json", {"signature": signature(run_dir),
+           "reviewed_at": datetime.now(timezone.utc).isoformat(), "source": "UI"})
+    # First reviews are useful even before both classes are sufficiently represented.
+    try:
+        model = build_registry(runs_dir)
+    except ValueError:
+        model = None
+    registry_note = ""
+    try:
+        if model is None:
+            raise ValueError("not enough validated labels to fit the dancer registry")
+        from .registry_workbook import write_registry_workbook
+        workbook = write_registry_workbook(model, runs_dir / "dancer_feature_registry.xlsx")
+        registry_note = f" Updated {workbook.name}."
+    except (ImportError, OSError, ValueError) as exc:
+        registry_note = f" Dancer registry refresh needs attention: {exc}"
+    # Both exports belong to the same saved-review action. Failure of one must
+    # not discard labels or prevent the other registry from updating.
+    training_note = refresh_after_review(runs_dir)
+    return {"validation": validation, "model": model, "training_note": training_note,
+            "registry_note": registry_note}
 
 
 def rebuild_registry_workbook(runs_dir: str | Path) -> Path:
