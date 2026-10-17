@@ -24,12 +24,14 @@ import numpy as np
 
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
 from ddc.overlay_cache import render_dancer_overlay
-from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
-                                  validate_checklist, load_merges, review_is_current)
+from ddc.feature_registry import validate_checklist, load_merges, review_is_current
 from ddc.dancer_features import load_labels
+from ddc.identity_learning import initialize_predictions, save_merge_review
+from ddc.io import load_jsonl
+from ddc.tracking import stable_track_ids
 from ddc.plots import timeline_figure, tracks_figure
 from ddc.skeleton import BODY
-from ddc.training import register_run, refresh_after_review, record_screening
+from ddc.training import predict_run
 from video_pipeline import analyze_video_mediapipe, analyze_video_rtmw, analyze_video_yolo
 
 MODEL_YOLO = "YOLO (body only, fast)"
@@ -172,10 +174,11 @@ def run_analysis(video_path: str, model_choice: str, track: bool, num_people: in
 
     note = (f"Tracked **{summary['frames']} frames** ({duration:.1f} s), up to "
             f"**{summary['max_people_detected']} people** in a frame.")
-    cohort = register_run(RUNS_DIR, run_dir.name)
-    if cohort and run_dir.name in cohort["runs"]:
-        progress(0.98, desc="Updating training registry...")
-        note += refresh_after_review(RUNS_DIR)
+    if model_choice != MODEL_MEDIAPIPE:
+        progress(.975, desc="Applying saved track-identity learning...")
+        learned = initialize_predictions(run_dir)
+        if learned:
+            note += f" Saved merge learning joined {sum(len(g) - 1 for g in learned)} duplicate track(s)."
     progress(1, desc="Pose analysis complete")
     if model_choice == MODEL_MEDIAPIPE:
         note += (" MediaPipe output is tracking-only: use the files below, or analyze with "
@@ -200,17 +203,16 @@ def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
 def _predict_people(run_name, groups, tracks):
     """Score the people currently shown and pick the predicted dancers.
 
-    Returns (selected labels, note).  Scoring uses the
-    same merged track ids as the list on screen and holds this run out of training.
+    Returns (selected labels, note). Scoring uses the same merged track ids as
+    the list on screen and the current saved LASSO/LSTM model snapshot.
     """
     labels = [tr.label for tr in tracks]
     try:
         model, predictions = predict_run(RUNS_DIR, run_name, merge_groups=groups)
     except ValueError as e:
-        # A first-ever run cannot be predicted until both classes have two human
-        # labels.  Keep the manual fallback explicit rather than silently training.
+        # Before a trained model exists, let the user supply the first labels.
         _LAST["predictions"] = []
-        record_screening(RUNS_DIR, run_name, [], groups)
+        _LAST.pop("model", None)
         return (labels,
                 f"Automatic screening needs validated examples first: {e}. All tracks are selected for review.")
 
@@ -220,28 +222,19 @@ def _predict_people(run_name, groups, tracks):
     _LAST["predictions"] = predictions
     _LAST["model"] = model
     _LAST["predicted_selected_ids"] = predicted_ids
-    record_screening(RUNS_DIR, run_name, predictions, groups)
-
-    # The workbook is a convenience: a failure must not discard the predictions above.
     # The preview video is NOT rendered here -- it re-encodes the whole clip and takes
     # a while, so it is only built when asked (see run_render_overlay).
-    problems = []
-    try:
-        # Add a Labels-style worksheet for this run immediately. Its local
-        # top-five weights populate once the checklist is validated.
-        rebuild_registry_workbook(RUNS_DIR)
-    except RuntimeError as e:
-        problems.append(f"Registry workbook refresh needs attention: {e}")
-    training_note = refresh_after_review(RUNS_DIR)
-
     weights = "; ".join(f"{item['feature_name']}: {item['standardized_coefficient']:+.3f}"
                         for item in model["selected_features"])
+    methods = sorted({item.get("method") or model.get("prediction_method") or "LASSO"
+                      for item in predictions})
+    method_note = ", ".join(methods) if methods else model.get("prediction_method", "LASSO")
     note = (f"Automatic checklist: {len(selected)} predicted dancer(s). Top-five model has "
-            f"{model['labelled_tracks']} validated track labels across {len(model['runs'])} run(s) "
-            f"(this run is held out of training). "
-            f"The checklist uses exactly these five standardized weights: {weights}. "
+            f"{model['reviewed_tracks']} validated track labels across {len(model['runs'])} run(s). "
+            f"Predictions use {method_note} from the saved model. "
+            f"The selected LASSO features and standardized weights are: {weights}. "
             "Compare confirms the original predictions unless you first Save reviewed labels. "
-            "Save records checklist corrections. " + " ".join(problems) + training_note)
+            "Save records checklist corrections.")
     return selected, note.strip()
 
 
@@ -306,22 +299,27 @@ def _show_people(run_name, groups, progress=None):
     return (gallery, gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
             gr.update(choices=labels, value=[]), tracks_figure(tracks),
             gr.update(value=None, visible=False), note, headline,  # preview is on demand
-            _review_status(selected), gr.update(interactive=True))
+            _review_status(selected), gr.update(interactive=True),
+            ("Saved merges restored. Save again after making changes."
+             if groups and load_merges(folder) == groups else
+             "Unsaved merge changes — click Save merges to use them in future analyses."
+             if groups or load_merges(folder) else
+             "Merge duplicate people, then save to teach future analyses."))
 
 
-N_PEOPLE_OUTPUTS = 10   # length of the tuple _show_people returns
+N_PEOPLE_OUTPUTS = 11   # length of the tuple _show_people returns
 
 
 def begin_review(run_name):
     """Jump to step 2 for `run_name` and blank everything left over from another run."""
     if not run_name:
-        return [gr.skip()] * 20
+        return [gr.skip()] * (2 + N_PEOPLE_OUTPUTS + 8)
     return (gr.Tabs(selected=TAB_DANCERS),
             f"### {_run_label(RUNS_DIR / run_name)}",
             # step 2
             None, gr.update(choices=[], value=[]), gr.update(choices=[], value=None),
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
-            "Finding people...", "", gr.update(interactive=False),
+            "Finding people...", "", gr.update(interactive=False), "",
             # step 3
             NO_RESULT_HINT, None, None, [], [], "", None, "")
 
@@ -339,9 +337,9 @@ def run_detect(run_name, progress=gr.Progress()):
         return [gr.skip()] * N_PEOPLE_OUTPUTS
     progress(0.1, desc="Finding people in the clip...")
     _LAST.clear()
-    out = _show_people(run_name, [], progress)
-    _LAST["n_auto"] = len(out[0])
-    return out
+    folder = RUNS_DIR / run_name
+    _, _LAST["n_auto"] = stable_track_ids(load_jsonl(folder / "tracking.jsonl"))
+    return _show_people(run_name, load_merges(folder), progress)
 
 
 def _require_people(run_name):
@@ -370,6 +368,32 @@ def run_reset_merges(run_name, progress=gr.Progress()):
     _require_people(run_name)
     progress(0.1, desc="Resetting merges...")
     return _show_people(run_name, [], progress)
+
+
+@_friendly("Saving merges")
+def run_save_merges(run_name, progress=gr.Progress()):
+    _require_people(run_name)
+    progress(.2, desc="Saving merges and learning track identities...")
+    report = save_merge_review(RUNS_DIR / run_name, _LAST.get("merges", []))
+    progress(1, desc="Merges saved")
+    if report["status"] == "training_failed":
+        return f"Merges saved. Identity model training needs attention: {report['error']}"
+    counts = f"{report['positive_pairs']} same-person and {report['negative_pairs']} different-person examples."
+    if report["status"] == "ready":
+        return ("✅ Merges saved. Identity model updated for future analyses using " + counts
+                + " Review dancer labels again if the merges changed.")
+    return ("✅ Merges saved. Collected " + counts
+            + " Learning needs both a merged pair and separate people visible together."
+            + " Review dancer labels again if the merges changed.")
+
+
+@_friendly("Refreshing saved merges")
+def refresh_saved_merges(run_name, save_message, progress=gr.Progress()):
+    """Re-score the saved merged identities and retain the merge-learning result."""
+    _require_people(run_name)
+    shown = list(_show_people(run_name, load_merges(RUNS_DIR / run_name), progress))
+    shown[-1] = save_message
+    return shown
 
 
 def update_ref_choices(track_choice, current):
@@ -581,11 +605,15 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                         gr.Markdown("Fragments are joined automatically when the tracker lost "
                                     "someone and found them again. If the same person still "
                                     "appears more than once, tick them here and merge. Merging "
-                                    "renumbers people, so the dancer predictions are recomputed.")
+                                    "renumbers people, so the dancer predictions are recomputed. "
+                                    "Save merges to remember the correction and teach future analyses. "
+                                    "To undo saved merges, reset and save again.")
                         merge_select = gr.CheckboxGroup(label="People to merge into one", choices=[])
                         with gr.Row():
                             merge_btn = gr.Button("Merge selected", size="sm")
                             reset_merge_btn = gr.Button("Reset merges", size="sm")
+                            save_merge_btn = gr.Button("Save merges", size="sm", variant="primary")
+                        merge_status = gr.Markdown()
                     track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
                     with gr.Row():
                         review_status = gr.Markdown()
@@ -653,7 +681,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                 csv_out = gr.File(label="Per-frame deviation CSV", scale=2)
 
     people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
-                      predicted_overlay, predictor_note, people_headline, review_status, cmp_btn]
+                      predicted_overlay, predictor_note, people_headline, review_status, cmp_btn, merge_status]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
                       csv_out, detail]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
@@ -690,6 +718,10 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     show_progress_on=people_gallery)
     reset_merge_btn.click(run_reset_merges, inputs=active_run, outputs=people_outputs,
                           show_progress_on=people_gallery)
+    save_merge_btn.click(run_save_merges, inputs=active_run, outputs=merge_status,
+                         show_progress_on=merge_status
+    ).success(refresh_saved_merges, inputs=[active_run, merge_status], outputs=people_outputs,
+              show_progress_on=people_gallery)
     track_select.change(update_ref_choices, inputs=[track_select, ref_dancer],
                         outputs=ref_dancer)
     track_select.change(_review_status, inputs=track_select, outputs=review_status)

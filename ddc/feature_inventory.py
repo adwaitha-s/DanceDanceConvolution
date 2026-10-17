@@ -1,4 +1,4 @@
-"""Wide pose-feature inventory, embedded selection, and classifier overlays.
+"""Wide pose-feature inventory and dancer preview overlays.
 
 This module reuses an existing ``tracking.jsonl``.  It never invokes pose
 detection.  The feature inventory is intentionally broad so the accompanying
@@ -10,7 +10,6 @@ supplied in an appropriate consented data source.
 
 from __future__ import annotations
 
-import csv
 import json
 import math
 from dataclasses import dataclass
@@ -19,9 +18,8 @@ from pathlib import Path
 import numpy as np
 
 from . import io as ddc_io
-from .dancer_features import CONF_THR, J, load_labels
-from .skeleton import BODY, EDGES
-from .tracking import TRACKING_VERSION, stable_track_ids, to_dense, tracking_stamp
+from .skeleton import BODY, CONF_THR, EDGES, J
+from .tracking import stable_track_ids, to_dense
 
 
 @dataclass(frozen=True)
@@ -139,11 +137,6 @@ def _specs() -> list[FeatureSpec]:
 
 FEATURE_SPECS = _specs()
 SPEC_BY_ID = {spec.id: spec for spec in FEATURE_SPECS}
-DERIVED_FEATURE_IDS = [spec.id for spec in FEATURE_SPECS if spec.availability.startswith("Derived")]
-# Context features (clip length, frame position, detected size, confidence) describe
-# how the camera saw a person, not how they move.  With few labelled tracks they
-# are easy to overfit and do not transfer to a new clip, so they are never predictors.
-ELIGIBLE_FEATURE_IDS = [spec.id for spec in FEATURE_SPECS if spec.predictor_eligible]
 
 
 def _clean(signal: np.ndarray) -> np.ndarray:
@@ -322,6 +315,44 @@ def normalize_merges(merge_groups) -> list[list[int]]:
     return sorted(sorted({int(t) for t in g}) for g in (merge_groups or []) if len({int(t) for t in g}) > 1)
 
 
+def pose_feature_values(poses, times, scales=None, signals=None):
+    """Use identical feature definitions for full clips and LSTM temporal windows."""
+    fs = 1 / float(np.median(np.diff(times))) if len(times) > 1 else 30.0
+    if scales is None:
+        scales = np.array([_torso_scale(pose) for pose in poses])
+    if signals is None:
+        signals = _frame_values(poses, scales)
+    pose_motion = _motion_signal(poses, scales, times)
+    wrist_motion = _motion_signal(poses[:, [J["left_wrist"], J["right_wrist"]]], scales, times)
+    limb_motion = _motion_signal(poses[:, [J["left_elbow"], J["right_elbow"], J["left_knee"], J["right_knee"]]], scales, times)
+    values = _time_features("time_pose_motion", pose_motion, .15)
+    values.update(_time_features("time_wrist_speed", wrist_motion, .15))
+    values.update(_time_features("time_limb_motion", limb_motion, .12))
+    for prefix, motion in (("pose", pose_motion), ("wrist", wrist_motion), ("limb", limb_motion)):
+        values.update(_frequency_features(f"freq_{prefix}", motion, fs))
+    for prefix, motion in (("pose", pose_motion), ("wrist", wrist_motion)):
+        values.update(_time_frequency_features(f"tf_{prefix}", motion, fs))
+    angle = _clean(signals["limb_angle"])
+    wrist_speed = _clean(wrist_motion)
+    wrist_accel = np.diff(wrist_speed) / (1 / fs) if len(wrist_speed) > 1 else np.array([])
+    values.update({
+        "physical_wrist_height_mean": _finite_mean(signals["wrist_height"]),
+        "physical_wrist_height_std": _finite_std(signals["wrist_height"]),
+        "physical_limb_extension_mean": _finite_mean(signals["limb_extension"]),
+        "physical_limb_extension_std": _finite_std(signals["limb_extension"]),
+        "physical_limb_angle_range_rad": np.ptp(np.unwrap(angle)) if len(angle) else np.nan,
+        "physical_body_sway": _finite_std(signals["body_x"]),
+        "physical_vertical_bounce": _finite_std(signals["body_y"]),
+        "physical_pose_compactness": _finite_mean(signals["compactness"]),
+        "physical_wrist_height_asymmetry": _finite_mean(signals["wrist_asymmetry"]),
+        "physical_step_width": _finite_mean(signals["step_width"]),
+        "physical_shoulder_tilt_abs_deg": _finite_mean(signals["shoulder_tilt"]),
+        "physical_wrist_acceleration_rms": np.sqrt(np.mean(wrist_accel ** 2)) if len(wrist_accel) else np.nan,
+    })
+    return {key: float(value) if np.isfinite(value) else None
+            for key, value in values.items() if key in SPEC_BY_ID}
+
+
 def collect_feature_inventory(tracking_jsonl: str | Path, merge_groups=None) -> list[dict]:
     """Return one wide feature record per persistent pose track.
 
@@ -364,44 +395,8 @@ def collect_feature_inventory(tracking_jsonl: str | Path, merge_groups=None) -> 
         poses = dense[:, tid]
         scales = np.array([_torso_scale(pose) for pose in poses])
         signals = _frame_values(poses, scales)
-        pose_motion = _motion_signal(poses, scales, det.t)
-        wrist_motion = _motion_signal(poses[:, [J["left_wrist"], J["right_wrist"]]], scales, det.t)
-        limb_motion = _motion_signal(poses[:, [J["left_elbow"], J["right_elbow"], J["left_knee"], J["right_knee"]]], scales, det.t)
         values: dict[str, float | str | None] = {spec.id: None for spec in FEATURE_SPECS}
-        values.update(_time_features("time_pose_motion", pose_motion, .15))
-        values.update({key: val for key, val in _time_features("time_wrist_speed", wrist_motion, .15).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _time_features("time_limb_motion", limb_motion, .12).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _frequency_features("freq_pose", pose_motion, fs).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _frequency_features("freq_wrist", wrist_motion, fs).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _frequency_features("freq_limb", limb_motion, fs).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _time_frequency_features("tf_pose", pose_motion, fs).items()
-                       if key in SPEC_BY_ID})
-        values.update({key: val for key, val in _time_frequency_features("tf_wrist", wrist_motion, fs).items()
-                       if key in SPEC_BY_ID})
-        angle = _clean(signals["limb_angle"])
-        wrist_speed = _clean(wrist_motion)
-        dt = 1 / fs
-        wrist_accel = np.diff(wrist_speed) / dt if len(wrist_speed) > 1 else np.array([])
-        physical = {
-            "physical_wrist_height_mean": _finite_mean(signals["wrist_height"]),
-            "physical_wrist_height_std": _finite_std(signals["wrist_height"]),
-            "physical_limb_extension_mean": _finite_mean(signals["limb_extension"]),
-            "physical_limb_extension_std": _finite_std(signals["limb_extension"]),
-            "physical_limb_angle_range_rad": np.ptp(np.unwrap(angle)) if len(angle) else np.nan,
-            "physical_body_sway": _finite_std(signals["body_x"]),
-            "physical_vertical_bounce": _finite_std(signals["body_y"]),
-            "physical_pose_compactness": _finite_mean(signals["compactness"]),
-            "physical_wrist_height_asymmetry": _finite_mean(signals["wrist_asymmetry"]),
-            "physical_step_width": _finite_mean(signals["step_width"]),
-            "physical_shoulder_tilt_abs_deg": _finite_mean(signals["shoulder_tilt"]),
-            "physical_wrist_acceleration_rms": np.sqrt(np.mean(wrist_accel ** 2)) if len(wrist_accel) else np.nan,
-        }
-        values.update({key: float(val) if np.isfinite(val) else None for key, val in physical.items()})
+        values.update(pose_feature_values(poses, det.t, scales, signals))
         frames_present = int(np.isfinite(poses[:, :, 0]).any(axis=1).sum())
         values.update({
             "context_frames_present": float(frames_present),
@@ -419,120 +414,6 @@ def collect_feature_inventory(tracking_jsonl: str | Path, merge_groups=None) -> 
         })
         rows.append({"track_id": tid, "frames_present": frames_present, "values": values})
     return rows
-
-
-def _fit_l1(z: np.ndarray, y: np.ndarray, l1: float = .025, iterations: int = 1800) -> tuple[np.ndarray, float]:
-    coef = np.zeros(z.shape[1])
-    intercept = 0.0
-    spectral = float(np.linalg.norm(z, ord=2) ** 2 / max(1, len(z)))
-    step = 1.0 / max(.25 * spectral, 1e-3)
-    for _ in range(iterations):
-        logits = np.clip(z @ coef + intercept, -30, 30)
-        probability = 1 / (1 + np.exp(-logits))
-        residual = probability - y
-        new_intercept = intercept - step * float(residual.mean())
-        raw = coef - step * (z.T @ residual / len(z))
-        new_coef = np.sign(raw) * np.maximum(np.abs(raw) - step * l1, 0)
-        if np.max(np.abs(new_coef - coef)) < 1e-8 and abs(new_intercept - intercept) < 1e-8:
-            coef, intercept = new_coef, new_intercept
-            break
-        coef, intercept = new_coef, new_intercept
-    return coef, float(intercept)
-
-
-def embedded_selection(rows: list[dict], labels: dict[int, int], n_features: int = 3) -> tuple[dict, list[dict]]:
-    """Fit embedded L1 logistic selection and return report plus track predictions."""
-    eligible = list(ELIGIBLE_FEATURE_IDS)
-    labelled = [row for row in rows if row["track_id"] in labels]
-    if len(labelled) < 4:
-        raise ValueError("need four labeled tracks for embedded feature selection")
-    raw = np.asarray([[row["values"].get(feature, np.nan) for feature in eligible] for row in labelled], float)
-    y = np.asarray([labels[row["track_id"]] for row in labelled], int)
-    if set(y) != {0, 1} or min((y == 0).sum(), (y == 1).sum()) < 2:
-        raise ValueError("need at least two dancers and two non_dancers")
-    # Some physically valid stationary tracks have no non-DC spectrum.  Keep
-    # them in the labelled sample and median-impute unavailable measurements;
-    # excluding them would inadvertently discard non-dancer evidence.
-    usable = np.isfinite(raw).sum(0) >= 2
-    eligible = [feature for feature, keep in zip(eligible, usable) if keep]
-    raw = raw[:, usable]
-    medians = np.nanmedian(raw, axis=0)
-    x = np.where(np.isfinite(raw), raw, medians)
-    mean, std = x.mean(0), x.std(0)
-    std[std < 1e-9] = 1.0
-    coef, intercept = _fit_l1((x - mean) / std, y)
-    order = np.argsort(np.abs(coef))[::-1]
-    selected = [eligible[i] for i in order[:n_features]]
-    # In the rare fully-shrunk case, retain the strongest standardized mean difference.
-    if not np.any(np.abs(coef)):
-        effect = np.abs(x[y == 1].mean(0) - x[y == 0].mean(0)) / std
-        order = np.argsort(effect)[::-1]
-        selected = [eligible[i] for i in order[:n_features]]
-        coef = effect
-    selections = []
-    for rank, i in enumerate(order[:n_features], 1):
-        selections.append({"rank": rank, "feature_id": eligible[i], "feature_name": SPEC_BY_ID[eligible[i]].name,
-                           "category": SPEC_BY_ID[eligible[i]].category, "coefficient": float(coef[i]),
-                           "absolute_influence": float(abs(coef[i]))})
-    idx = [eligible.index(feature) for feature in selected]
-    reduced_coef, reduced_intercept = _fit_l1((x[:, idx] - mean[idx]) / std[idx], y, l1=.01)
-    predictions = []
-    for row in rows:
-        values = np.asarray([row["values"].get(feature, np.nan) for feature in selected], float)
-        selected_medians = medians[idx]
-        values = np.where(np.isfinite(values), values, selected_medians)
-        score = float((values - mean[idx]) / std[idx] @ reduced_coef + reduced_intercept)
-        probability = float(1 / (1 + math.exp(-max(-30, min(30, score)))))
-        predicted = "dancer" if probability >= .5 else "non_dancer"
-        predictions.append({"track_id": row["track_id"], "frames_present": row["frames_present"],
-                            "reviewed_label": "dancer" if labels.get(row["track_id"]) == 1 else
-                                              "non_dancer" if labels.get(row["track_id"]) == 0 else "",
-                            "predicted_label": predicted, "dancer_probability": probability})
-    training_hits = sum(pred["predicted_label"] == ("dancer" if labels[pred["track_id"]] else "non_dancer")
-                        for pred in predictions if pred["track_id"] in labels)
-    report = {
-        "selection_method": "Embedded L1 logistic regression",
-        "labeled_tracks": len(labelled), "dancers": int(y.sum()), "non_dancers": int((y == 0).sum()),
-        "top_feature_count": len(selected), "selected_features": selections,
-        "training_accuracy": training_hits / len(labelled),
-        "excluded_human_features": [spec.id for spec in FEATURE_SPECS if spec.category == "Human-related"],
-    }
-    return report, predictions
-
-
-def write_inventory_artifacts(tracking_jsonl: str | Path, labels_csv: str | Path, out_dir: str | Path,
-                              merge_groups=None) -> dict:
-    """Create machine-readable wide/long inventory files without rerunning detection."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rows = collect_feature_inventory(tracking_jsonl, merge_groups)
-    report, predictions = embedded_selection(rows, load_labels(labels_csv))
-    catalog = [spec.__dict__ for spec in FEATURE_SPECS]
-    payload = {"source_tracking_jsonl": str(tracking_jsonl), "merge_groups": normalize_merges(merge_groups),
-               "tracking_version": TRACKING_VERSION,
-               "tracking_stamp": tracking_stamp(tracking_jsonl),
-               "catalog": catalog, "tracks": rows,
-               "selection": report, "predictions": predictions}
-    inventory_json = out_dir / "feature_inventory.json"
-    inventory_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    with (out_dir / "feature_catalog.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(catalog[0]))
-        writer.writeheader(); writer.writerows(catalog)
-    headers = ["track_id", "frames_present", *[spec.id for spec in FEATURE_SPECS]]
-    with (out_dir / "track_feature_inventory.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({"track_id": row["track_id"], "frames_present": row["frames_present"], **row["values"]})
-    prediction_path = out_dir / "dancer_predictions.csv"
-    with prediction_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(predictions[0]))
-        writer.writeheader(); writer.writerows(predictions)
-    selection_path = out_dir / "embedded_feature_selection.json"
-    selection_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return {"inventory": str(inventory_json), "catalog": str(out_dir / "feature_catalog.csv"),
-            "matrix": str(out_dir / "track_feature_inventory.csv"), "predictions": str(prediction_path),
-            "selection": str(selection_path), **report}
 
 
 def _source_video(run_dir: Path, video_path: str | Path | None = None) -> Path:
@@ -564,14 +445,9 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
     from video_pipeline import _cfr_source, _reencode_h264, open_video
 
     run_dir = Path(run_dir)
-    pred_path = run_dir / "dancer_predictions.csv"
     if predictions is None:
-        if not pred_path.exists():
-            raise ValueError("no dancer predictions for this run; validate another run first")
-        with pred_path.open(newline="") as f:
-            prediction_map = {int(row["track_id"]): row["predicted_label"] for row in csv.DictReader(f)}
-    else:
-        prediction_map = {int(row["track_id"]): row["predicted_label"] for row in predictions}
+        raise ValueError("preview requires the current dancer selection")
+    prediction_map = {int(row["track_id"]): row["predicted_label"] for row in predictions}
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     ids, _ = stable_track_ids(det, merge_groups)
     source = _source_video(run_dir, video_path)
@@ -633,9 +509,5 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
     finally:
         cap.release(); writer.release(); source_context.__exit__(None, None, None)
     _reencode_h264(raw_overlay, overlay)
-    selected = []
-    selection_path = run_dir / "embedded_feature_selection.json"
-    if selection_path.exists():
-        selected = json.loads(selection_path.read_text())["selected_features"]
-    return {"overlay": str(overlay), "json": str(json_out), "show_non_dancers": show_non_dancers,
-            "selected_features": selected}
+    return {"overlay": str(overlay), "json": str(json_out),
+            "show_non_dancers": show_non_dancers}

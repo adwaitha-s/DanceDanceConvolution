@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .feature_inventory import _source_video, normalize_merges, render_classifier_overlay
 from .tracking import TRACKING_VERSION
+from .identity_learning import prediction_stamp
 
 # Bump when the drawing code changes so old cached renders are not reused.
 RENDER_VERSION = 1
@@ -30,6 +31,7 @@ def overlay_key(run_dir: Path, source: Path, merge_groups, dancer_ids, max_heigh
         "tracking_version": TRACKING_VERSION,
         "source": [source.name, source.stat().st_size, source.stat().st_mtime_ns],
         "tracking": [tracking.stat().st_size, tracking.stat().st_mtime_ns],
+        "learned_identities": prediction_stamp(tracking),
         "merges": normalize_merges(merge_groups),
         "dancers": sorted(int(i) for i in dancer_ids),
     }, sort_keys=True)

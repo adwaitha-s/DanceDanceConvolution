@@ -13,5 +13,4 @@ scipy>=1.11
 openpyxl>=3.0
 plotly>=5.20
 pytest>=8.0
-scikit-learn>=1.5
 filelock>=3.15

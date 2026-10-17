@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from ddc.dancer_features import write_synthetic_demo
+from test_data import write_synthetic_demo
 from ddc.overlay_cache import overlay_key, render_dancer_overlay
 
 

@@ -68,7 +68,6 @@ def test_compare_before_save_confirms_original_predictions_despite_unsaved_edits
         calls.append((selected, kwargs["review_action"]))
         return {"validation": {"status": "validated_correct", "corrected_track_ids": []}}
     monkeypatch.setattr(app, "validate_checklist", validate)
-    monkeypatch.setattr(app, "rebuild_registry_workbook", lambda root: None)
     note = app._validate_comparison("run", [1])
     assert calls == [([0], "compare_confirmed")]
     assert "all correct" in note
@@ -92,3 +91,75 @@ def test_compare_without_predictions_does_not_invent_validation_labels(monkeypat
     import app
     monkeypatch.setattr(app, "_LAST", {"predictions": []})
     assert "Save reviewed labels" in app._validate_comparison("run", [0])
+
+
+def test_save_merges_button_and_reopening_use_original_automatic_ids(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+    from ddc.identity_learning import save_merge_review
+
+    run = _run(tmp_path, "review")
+    save_merge_review(run, [[0, 2]])
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    monkeypatch.setattr(app, "_predict_people",
+                        lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
+    out = app.run_detect(run.name)
+    assert len(out) == app.N_PEOPLE_OUTPUTS
+    assert len(out[0]) == 2
+    assert app._LAST["n_auto"] == 3  # further merges must use original ids
+    assert app._LAST["merges"] == [[0, 2]]
+    assert any(getattr(block, "value", None) == "Save merges" for block in app.demo.blocks.values())
+    assert "Merges saved" in app.run_save_merges(run.name)
+
+    reset = app.run_reset_merges(run.name)
+    assert len(reset[0]) == 3
+    assert "Unsaved" in reset[-1]
+    assert "Merges saved" in app.run_save_merges(run.name)
+    assert len(app.run_detect(run.name)[0]) == 3
+
+
+def test_cumulative_merges_remain_correct_after_reopening(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+    from ddc.identity_learning import save_merge_review
+
+    run = _run(tmp_path, "review", fragments=3)
+    save_merge_review(run, [[0, 2]])
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    monkeypatch.setattr(app, "_predict_people",
+                        lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
+    app.run_detect(run.name)
+    labels = app._LAST["track_labels"]
+    app.run_merge(run.name, [labels[0], labels[2]])
+    assert app._LAST["merges"] == [[0, 2, 3]]
+    app.run_save_merges(run.name)
+    assert len(app.run_detect(run.name)[0]) == 2
+    assert app._LAST["merges"] == [[0, 2, 3]]
+
+
+def test_saving_merges_refreshes_predictions_from_persisted_groups(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+
+    run = _run(tmp_path, "review")
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    scored_groups = []
+
+    def predict(name, groups, tracks):
+        scored_groups.append(groups)
+        return [tr.label for tr in tracks], "test"
+
+    monkeypatch.setattr(app, "_predict_people", predict)
+    app.run_detect(run.name)
+    labels = app._LAST["track_labels"]
+    app.run_merge(run.name, [labels[0], labels[2]])
+    message = app.run_save_merges(run.name)
+
+    scored_groups.clear()
+    shown = app.refresh_saved_merges(run.name, message)
+    assert scored_groups == [[[0, 2]]]
+    assert app._LAST["merges"] == [[0, 2]]
+    assert shown[-1] == message

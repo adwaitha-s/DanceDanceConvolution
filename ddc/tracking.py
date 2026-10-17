@@ -20,11 +20,19 @@ TRACKING_VERSION = 2
 _TRACK_CACHE = OrderedDict()
 
 
-def tracking_stamp(path):
-    """Metadata of every input that can change the assignment of track identities."""
+def baseline_stamp(path):
+    """Inputs to the motion/appearance tracker, before learned and manual joins."""
     from pathlib import Path
     stat = Path(path).stat()
     return [TRACKING_VERSION, stat.st_size, stat.st_mtime_ns, source_stamp(path)]
+
+
+def tracking_stamp(path):
+    """Include the frozen identity model decisions in all downstream cache keys."""
+    from .identity_learning import prediction_stamp
+    stamp = baseline_stamp(path)
+    identity = prediction_stamp(path)
+    return stamp + [identity] if identity is not None else stamp
 
 
 def _size(p: np.ndarray) -> float:
@@ -398,7 +406,7 @@ def to_dense(kps: list, track_ids: list, n_tracks: int) -> np.ndarray:
 
 
 def stable_track_ids(det, merge_groups=None, return_info: bool = False):
-    """Final per-frame track ids for a loaded run: automatic stitching, then any manual merges.
+    """Final track ids: automatic stitching, frozen learned joins, then manual merges.
 
     This is the one place that defines "who is person N" for a run.  The Find people
     list, the composite analysis and the dancer-filtering features must all use it, or
@@ -408,7 +416,7 @@ def stable_track_ids(det, merge_groups=None, return_info: bool = False):
     fps = float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
     source_ids = det.ids if getattr(det, "ids_persistent", False) else None
     path = getattr(det, "path", None)
-    key = (str(path), json.dumps(tracking_stamp(path))) if path is not None else None
+    key = (str(path), json.dumps(baseline_stamp(path))) if path is not None else None
     if key is not None and key in _TRACK_CACHE:
         _TRACK_CACHE.move_to_end(key)
         ids, n, info = _TRACK_CACHE[key]
@@ -423,13 +431,16 @@ def stable_track_ids(det, merge_groups=None, return_info: bool = False):
                 _TRACK_CACHE.popitem(last=False)
     ids = [a.copy() for a in ids]
     info = {"raw": [a.copy() for a in info["raw"]], "fragments": list(info["fragments"])}
-    groups = [sorted(set(g)) for g in (merge_groups or []) if len(set(g)) > 1]
-    if groups:
-        ids, n = merge_track_ids(det.kps, ids, groups)
-        target = {i: i for i in range(len(info["fragments"]))}
-        for group in groups:
-            for tid in group:
-                target[tid] = group[0]
-        info["fragments"] = [sum(info["fragments"][t] for t in target if target[t] == k)
-                             for k in sorted(set(target.values()))]
+    from .identity_learning import prediction_groups
+    learned = prediction_groups(path) if path is not None else []
+    for merge_stage in (learned, merge_groups):
+        groups = [sorted(set(g)) for g in (merge_stage or []) if len(set(g)) > 1]
+        if groups:
+            ids, n = merge_track_ids(det.kps, ids, groups)
+            target = {i: i for i in range(len(info["fragments"]))}
+            for group in groups:
+                for tid in group:
+                    target[tid] = group[0]
+            info["fragments"] = [sum(info["fragments"][t] for t in target if target[t] == k)
+                                 for k in sorted(set(target.values()))]
     return (ids, n, info) if return_info else (ids, n)

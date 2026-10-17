@@ -9,7 +9,7 @@ Usage:
     python pose_demo.py                          # webcam 0, cpu, writes pose_stream.jsonl
     python pose_demo.py --source video.mp4 --out out.jsonl
     python pose_demo.py --source photo.jpg --no-display
-    python pose_demo.py --track --stdout | python examples/example_consumer.py
+    python pose_demo.py --track --stdout --no-display
 """
 
 from __future__ import annotations

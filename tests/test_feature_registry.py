@@ -1,186 +1,78 @@
 import json
 
-from ddc.dancer_features import write_synthetic_demo
-from ddc.feature_registry import build_registry, predict_run, validate_checklist
+import pytest
+
+from ddc.dancer_features import load_labels
+from ddc.feature_registry import load_merges, review_is_current, validate_checklist
+from test_data import write_synthetic_demo
 
 
-def _make_run(root, name, *, labels):
+def _make_run(root, name):
     run = root / name
     run.mkdir()
-    label_path = run / "labels.csv" if labels else root / f"{name}-source-labels.csv"
-    write_synthetic_demo(run / "tracking.jsonl", label_path, frames=40)
+    write_synthetic_demo(run / "tracking.jsonl", root / f"{name}-source-labels.csv", frames=40)
     return run
 
 
 def test_legacy_track_reviews_are_not_attached_to_new_identities(tmp_path):
-    from ddc.feature_registry import _training_records, load_merges, review_is_current
     from ddc.tracking import TRACKING_VERSION, tracking_stamp
-    run = _make_run(tmp_path, "reviewed", labels=True)
+
+    run = _make_run(tmp_path, "reviewed")
     validation = run / "prediction_validation.json"
     validation.write_text(json.dumps({"status": "validated_correct"}))
     (run / "merges.json").write_text(json.dumps([[0, 1]]))
     assert not review_is_current(run)
     assert load_merges(run) == []
-    assert _training_records(tmp_path) == []
     (run / "merges.json").write_text("[]")
     validation.write_text(json.dumps({"tracking_version": TRACKING_VERSION,
                                       "tracking_stamp": tracking_stamp(run / "tracking.jsonl")}))
     assert review_is_current(run)
-    assert len(_training_records(tmp_path)) == 8
 
 
-def test_old_feature_inventory_is_recomputed_after_tracker_changes(tmp_path, monkeypatch):
-    import ddc.feature_registry as registry
-    from ddc.tracking import TRACKING_VERSION
-    run = _make_run(tmp_path, "cached", labels=True)
-    inventory = run / "feature_inventory.json"
-    inventory.write_text(json.dumps({"merge_groups": [], "tracks": [{"track_id": 99}],
-                                     "tracking_version": TRACKING_VERSION - 1}))
-    fresh = [{"track_id": 0}]
-    monkeypatch.setattr(registry, "collect_feature_inventory", lambda *args: fresh)
-    assert registry._load_run_rows(run) == fresh
+def test_review_records_corrections_and_preserves_original_predictions(tmp_path):
+    run = _make_run(tmp_path, "candidate")
+    predictions = [{"track_id": i, "predicted_label": "dancer" if i < 4 else "non_dancer",
+                    "dancer_probability": .8 if i < 4 else .2} for i in range(8)]
 
-
-def test_registry_scores_with_only_the_workbook_top_five_features(tmp_path):
-    _make_run(tmp_path, "training", labels=True)
-    _make_run(tmp_path, "candidate", labels=False)
-
-    model, predictions = predict_run(tmp_path, "candidate")
-
-    assert len(model["feature_ids"]) == 5
-    assert model["feature_ids"] == [item["feature_id"] for item in model["selected_features"]]
-    assert all(len(item["top_predictors"]) == 5 for item in predictions)
-    assert all(
-        [feature["feature_id"] for feature in item["top_predictors"]] == model["feature_ids"]
-        for item in predictions
-    )
-
-
-def test_review_validation_records_corrections_and_preserves_original_prediction(tmp_path):
-    _make_run(tmp_path, "training", labels=True)
-    candidate = _make_run(tmp_path, "candidate", labels=False)
-    _, predictions = predict_run(tmp_path, "candidate")
-    predicted_dancers = [item["track_id"] for item in predictions
-                         if item["predicted_label"] == "dancer"]
-
-    unchanged = validate_checklist(tmp_path, "candidate", predicted_dancers, predictions)
+    unchanged = validate_checklist(tmp_path, "candidate", [0, 1, 2, 3], predictions)
     assert unchanged["validation"]["status"] == "validated_correct"
     assert unchanged["validation"]["corrected_track_ids"] == []
 
-    changed_selection = [track for track in predicted_dancers if track != 0]
-    if 0 not in predicted_dancers:
-        changed_selection.append(0)
-    corrected = validate_checklist(tmp_path, "candidate", changed_selection, predictions)
+    corrected = validate_checklist(tmp_path, "candidate", [1, 2, 3, 4], predictions)
     assert corrected["validation"]["status"] == "corrected"
-    assert 0 in corrected["validation"]["corrected_track_ids"]
-
-    validation = json.loads((candidate / "prediction_validation.json").read_text())
+    assert corrected["validation"]["corrected_track_ids"] == [0, 4]
+    assert load_labels(run / "labels.csv") == {i: int(i in (1, 2, 3, 4)) for i in range(8)}
+    validation = json.loads((run / "prediction_validation.json").read_text())
     assert validation["predictor_labels"] == {
-        str(item["track_id"]): item["predicted_label"] for item in predictions
-    }
-    rebuilt = build_registry(tmp_path)
-    candidate_detail = next(run for run in rebuilt["runs_detail"] if run["run"] == "candidate")
-    assert {str(track["track_id"]): track["predicted_label"] for track in candidate_detail["tracks"]} == validation["predictor_labels"]
+        str(item["track_id"]): item["predicted_label"] for item in predictions}
+    assert review_is_current(run)
+    assert not (tmp_path / "dancer_feature_registry.xlsx").exists()
 
 
-def test_scored_run_is_held_out_of_training(tmp_path):
-    _make_run(tmp_path, "training", labels=True)
-    _make_run(tmp_path, "candidate", labels=True)  # already reviewed
-
-    model, _ = predict_run(tmp_path, "candidate")
-
-    assert model["held_out_run"] == "candidate"
-    assert model["runs"] == ["training"]
-
-
-def test_scoring_needs_labels_from_another_run(tmp_path):
-    import pytest
-    _make_run(tmp_path, "only", labels=True)
-    with pytest.raises(ValueError):
-        predict_run(tmp_path, "only")
-
-
-def test_camera_context_features_are_never_predictors(tmp_path):
-    from ddc.feature_inventory import ELIGIBLE_FEATURE_IDS
-    assert not [f for f in ELIGIBLE_FEATURE_IDS if f.startswith("context_")]
-    _make_run(tmp_path, "training", labels=True)
-    _make_run(tmp_path, "candidate", labels=False)
-    model, _ = predict_run(tmp_path, "candidate")
-    assert not [f for f in model["feature_ids"] if f.startswith("context_")]
-
-
-def test_workbook_keeps_summary_and_labels_without_individual_dancer_statistics(tmp_path):
-    from openpyxl import load_workbook
-    from ddc.feature_registry import rebuild_registry_workbook
-    _make_run(tmp_path, "training", labels=True)
-    _make_run(tmp_path, "candidate", labels=False)
-
-    path = rebuild_registry_workbook(tmp_path)
-
-    wb = load_workbook(path)
-    assert wb.sheetnames[:3] == ["Registry Summary", "Feature Inventory Summary", "Feature Catalog"]
-    assert "Labels-training" in wb.sheetnames and "Labels-candidate" in wb.sheetnames
-    assert len(wb.sheetnames) == 5
-    model = json.loads((tmp_path / "feature_model_registry.json").read_text())
-    assert all("top_predictors" not in track for run in model["runs_detail"] for track in run["tracks"])
-    summary = wb["Registry Summary"]
-    assert [summary.cell(row=r, column=2).value for r in range(11, 16)]  # five predictors
-    assert wb["Labels-training"]["A5"].value == 0
-
-
-def test_workbook_failure_is_a_runtime_error(tmp_path):
-    import pytest
-    from ddc.feature_registry import rebuild_registry_workbook
-    _make_run(tmp_path, "only", labels=False)  # no labels anywhere -> cannot fit
-    with pytest.raises(RuntimeError, match="workbook builder failed"):
-        rebuild_registry_workbook(tmp_path)
-
-
-def test_missing_openpyxl_is_a_runtime_error(tmp_path, monkeypatch):
-    import builtins
-    import pytest
-    from ddc.feature_registry import rebuild_registry_workbook
-    _make_run(tmp_path, "training", labels=True)
-    _make_run(tmp_path, "candidate", labels=False)
-    real_import = builtins.__import__
-
-    def fake(name, *a, **k):
-        if name == "openpyxl" or name.startswith("openpyxl."):
-            raise ImportError("No module named 'openpyxl'")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", fake)
-    monkeypatch.delitem(__import__("sys").modules, "ddc.registry_workbook", raising=False)
-    with pytest.raises(RuntimeError, match="pip install"):
-        rebuild_registry_workbook(tmp_path)
-
-
-def _people_ids(run_dir, merge_groups=None):
-    from ddc.analyze import detect_tracks
-    return [t.track_id for t in detect_tracks(run_dir, merge_groups=merge_groups)]
+def test_unknown_track_cannot_change_saved_review(tmp_path):
+    run = _make_run(tmp_path, "candidate")
+    with pytest.raises(ValueError, match="unknown track"):
+        validate_checklist(tmp_path, "candidate", [99], [])
+    assert not (run / "labels.csv").exists()
+    assert not (run / "merges.json").exists()
 
 
 def test_feature_rows_use_the_same_track_ids_as_find_people(tmp_path):
+    from ddc.analyze import detect_tracks
     from ddc.feature_inventory import collect_feature_inventory
-    run = _make_run(tmp_path, "run", labels=True)
+
+    run = _make_run(tmp_path, "candidate")
     for groups in (None, [[0, 1]], [[0, 1], [4, 5]]):
-        shown = _people_ids(run, groups)
+        shown = [t.track_id for t in detect_tracks(run, merge_groups=groups)]
         rows = [r["track_id"] for r in collect_feature_inventory(run / "tracking.jsonl", groups)]
         assert rows == shown
-    assert len(_people_ids(run, [[0, 1]])) == len(_people_ids(run)) - 1
 
 
 def test_saved_merges_travel_with_the_labels(tmp_path):
-    from ddc.feature_registry import _load_run_rows, load_merges
-    _make_run(tmp_path, "training", labels=True)
-    candidate = _make_run(tmp_path, "candidate", labels=False)
-    _, predictions = predict_run(tmp_path, "candidate", merge_groups=[[0, 1]])
-    assert len(predictions) == 7  # merged: one fewer person than the unmerged 8
-
-    selected = [p["track_id"] for p in predictions if p["predicted_label"] == "dancer"]
-    validate_checklist(tmp_path, "candidate", selected, predictions, merge_groups=[[0, 1]])
-
-    assert load_merges(candidate) == [[0, 1]]
-    assert len(_load_run_rows(candidate)) == 7          # rebuilt with the saved merges
-    model, _ = predict_run(tmp_path, "training")         # candidate now trains with 7 tracks
-    assert model["labelled_tracks"] == 7
+    run = _make_run(tmp_path, "candidate")
+    predictions = [{"track_id": i, "predicted_label": "dancer" if i < 3 else "non_dancer",
+                    "dancer_probability": .8 if i < 3 else .2} for i in range(7)]
+    validate_checklist(tmp_path, "candidate", [0, 1, 2], predictions, merge_groups=[[0, 1]])
+    assert load_merges(run) == [[0, 1]]
+    assert len(load_labels(run / "labels.csv")) == 7
+    assert review_is_current(run)

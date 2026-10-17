@@ -14,13 +14,57 @@ def matrix(records):
                         else np.nan for fid in PREDICTOR_IDS] for r in records], float)
 
 
-def fit_lasso(records):
-    from sklearn.impute import SimpleImputer
-    from sklearn.linear_model import Lasso
-    from sklearn.model_selection import GroupKFold
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
+def _prepare(x):
+    """Fit median imputation and standardization on this training fold only."""
+    medians = np.array([np.median(column[np.isfinite(column)])
+                        if np.isfinite(column).any() else 0.
+                        for column in x.T], float)
+    filled = np.where(np.isfinite(x), x, medians)
+    mean, std = filled.mean(axis=0), filled.std(axis=0)
+    std = np.where(std > 1e-12, std, 1.)
+    return (filled - mean) / std, medians, mean, std
 
+
+def _lasso(x, y, alpha):
+    """Coordinate descent for ||y - Xw - b||²/(2n) + alpha*||w||₁."""
+    centered_y = y - y.mean()
+    gram = x.T @ x / len(x)
+    residual_covariance = x.T @ centered_y / len(x)
+    coef = np.zeros(x.shape[1], float)
+    for _ in range(3000):
+        largest_change = 0.
+        for j in range(len(coef)):
+            variance = gram[j, j]
+            if variance <= 1e-12:
+                continue
+            unpenalized = residual_covariance[j] + variance * coef[j]
+            updated = np.sign(unpenalized) * max(abs(unpenalized) - alpha, 0.) / variance
+            change = updated - coef[j]
+            if change:
+                coef[j] = updated
+                residual_covariance -= gram[:, j] * change
+                largest_change = max(largest_change, abs(change))
+        if largest_change < 1e-7:
+            break
+    return coef, float(y.mean())
+
+
+def _folds(groups):
+    """Balance whole videos among up to five folds; never split one video's tracks."""
+    names, counts = np.unique(groups, return_counts=True)
+    fold_groups = [[] for _ in range(min(5, len(names)))]
+    sizes = [0] * len(fold_groups)
+    for name, count in sorted(zip(names, counts), key=lambda item: (-item[1], item[0])):
+        fold = int(np.argmin(sizes))
+        fold_groups[fold].append(name)
+        sizes[fold] += int(count)
+    for held_out in fold_groups:
+        test = np.flatnonzero(np.isin(groups, held_out))
+        train = np.flatnonzero(~np.isin(groups, held_out))
+        yield train, test
+
+
+def fit_lasso(records):
     y = np.asarray([r["label"] for r in records], int)
     groups = np.asarray([r["run"] for r in records])
     if len(y) < 4 or any((y == c).sum() < 2 for c in (0, 1)):
@@ -33,38 +77,37 @@ def fit_lasso(records):
         raise ValueError("Fewer than five measurable pose features")
     x = x[:, usable]
 
-    def pipeline(alpha):
-        return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True),
-                             StandardScaler(), Lasso(alpha=float(alpha), max_iter=20000, tol=1e-5))
-
-    folds = list(GroupKFold(n_splits=min(5, len(set(groups)))).split(x, y, groups))
+    folds = list(_folds(groups))
     candidates = []
     for alpha in np.geomspace(.3, .00001, 24):
         losses = []
         for train, test in folds:
-            estimator = pipeline(alpha).fit(x[train], y[train])
-            losses.append(float(np.mean((estimator.predict(x[test]) - y[test]) ** 2)))
-        fitted = pipeline(alpha).fit(x, y)
-        coef = fitted[-1].coef_
+            z, medians, mean, std = _prepare(x[train])
+            fold_coef, fold_intercept = _lasso(z, y[train], alpha)
+            held_out = (np.where(np.isfinite(x[test]), x[test], medians) - mean) / std
+            losses.append(float(np.mean((held_out @ fold_coef + fold_intercept - y[test]) ** 2)))
+        z, medians, mean, std = _prepare(x)
+        coef, _ = _lasso(z, y, alpha)
         # Do not pad a sparse fit with zero-weight features and call them predictors.
         if np.count_nonzero(np.abs(coef) > 1e-7) >= 5:
-            candidates.append((float(np.mean(losses)), float(alpha), fitted))
+            candidates.append((float(np.mean(losses)), float(alpha), coef))
     if not candidates:
         raise ValueError("LASSO found fewer than five nonzero predictors; collect more varied labels")
-    mse, alpha, fitted = min(candidates, key=lambda c: (c[0], -c[1]))
-    coef = fitted[-1].coef_
+    mse, alpha, coef = min(candidates, key=lambda c: (c[0], -c[1]))
     order = np.argsort(-np.abs(coef), kind="stable")[:5]
     # Refit a five-input model with the selected alpha. Ranking weights remain explicit.
-    top_model = pipeline(alpha).fit(x[:, order], y)
+    top_z, top_medians, top_mean, top_std = _prepare(x[:, order])
+    top_coef, top_intercept = _lasso(top_z, y, alpha)
     selected = usable[order]
     return {
         "method": "LASSO squared error on dancer=1/non_dancer=0; video-group CV",
+        "solver": "NumPy coordinate descent v1",
         "feature_ids": [PREDICTOR_IDS[i] for i in selected],
         "ranking_coefficients": coef[order].tolist(),
-        "coefficient": top_model[-1].coef_.tolist(),
-        "intercept": float(top_model[-1].intercept_),
-        "medians": top_model[0].statistics_.tolist(),
-        "mean": top_model[1].mean_.tolist(), "std": top_model[1].scale_.tolist(),
+        "coefficient": top_coef.tolist(),
+        "intercept": top_intercept,
+        "medians": top_medians.tolist(),
+        "mean": top_mean.tolist(), "std": top_std.tolist(),
         "alpha": alpha, "selection_cv_mse": mse,
         "cv_note": "Alpha-selection CV error, not an independent test score",
         "runs": sorted(set(groups.tolist())), "reviewed_tracks": len(records),

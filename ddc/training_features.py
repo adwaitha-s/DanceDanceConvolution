@@ -1,10 +1,10 @@
-"""The fixed, auditable 40-candidate catalog for the ten-video study."""
+"""The fixed, auditable 40-candidate catalog for the 15-video cohort."""
 
 from dataclasses import replace
 
 from .feature_inventory import SPEC_BY_ID
 
-# Keep the broader exploratory inventory intact for existing users.
+# Thirty-five pose-derived candidates and five external human annotations.
 FEATURE_IDS = [
     "time_pose_motion_mean", "time_pose_motion_std", "time_pose_motion_median",
     "time_pose_motion_iqr", "time_pose_motion_p95", "time_pose_motion_active_fraction",
