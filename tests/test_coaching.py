@@ -160,3 +160,75 @@ def test_analyze_csv_retains_raw_columns_and_adds_similarity(tmp_path):
     assert all(row['dancer'] == '2' for row in rows)
     assert float(rows[0]['score']) == pytest.approx(0)
     assert float(rows[0]['movement_similarity']) == pytest.approx(100)
+
+
+def test_key_moments_rank_sustained_events_and_keep_peak_and_range():
+    from ddc.coaching import key_moments
+    p = poses(frames=50)
+    p[2:8, 1, J['left_wrist'], 1] = .4
+    p[25:33, 1, J['right_ankle'], 0] = .9
+    moments = key_moments(p, np.arange(50) / 10)
+    assert len(moments) == 2
+    assert moments[0].dancers == (0, 1)
+    assert (moments[0].start, moments[0].end, moments[0].peak) == (2.5, 3.2, 2.5)
+    assert moments[0].region == 'legs' and moments[0].joint == 'right_ankle'
+    assert moments[0].comparable_joints == 17
+    assert moments[0].mean_deviation == pytest.approx(.9 / 17)
+    assert moments[1].region == 'arms' and moments[1].joint == 'left_wrist'
+    assert moments[1].mean_deviation < moments[0].mean_deviation
+
+
+def test_key_moments_ignore_spikes_matches_and_single_dancers():
+    from ddc.coaching import key_moments
+    p = poses(frames=20)
+    p[2, 1, :, 0] = 10  # one-frame detector spike is not a sustained mismatch
+    assert key_moments(p, np.arange(20) / 10) == []
+    assert key_moments(poses(frames=20), np.arange(20) / 10) == []
+    assert key_moments(p[:, :1], np.arange(20) / 10) == []
+    assert key_moments(p, np.arange(20) / 10, top_n=0) == []
+
+
+def test_key_moments_missing_and_unreliable_joints_break_events():
+    from ddc.coaching import key_moments
+    p = poses(frames=12)
+    p[:, 1, :, 0] = 1
+    # Only one short continuous overlap remains in each case.
+    p[2:10, 1] = np.nan
+    assert key_moments(p, np.arange(12) / 10) == []
+    p = poses(frames=12)
+    p[:, 1, :, 0] = 1
+    p[:, 0, 5:, 2] = .1  # < 6 shared confident joints
+    assert key_moments(p, np.arange(12) / 10) == []
+    p[:, 0, 5, 2] = .9
+    moments = key_moments(p, np.arange(12) / 10)
+    assert len(moments) == 1 and moments[0].comparable_joints == 6
+    p[:, 0, :, 2] = np.nan
+    assert key_moments(p, np.arange(12) / 10) == []
+
+
+def test_key_moments_do_not_bridge_large_time_gaps():
+    from ddc.coaching import key_moments
+    p = poses(frames=6)
+    p[:, 1, :, 0] = 1
+    assert key_moments(p, [.0, .1, .2, 8., 8.1, 8.2]) == []
+
+
+def test_key_moments_separate_simultaneous_pairs_and_apply_top_n():
+    from ddc.coaching import key_moments
+    p = poses(frames=40, dancers=3)
+    p[2:8, 1, :, 0] = .5
+    p[2:8, 2, :, 0] = 1
+    p[25:33, 1, :, 0] = .3
+    moments = key_moments(p, np.arange(40) / 10)
+    assert len(moments) == 2
+    assert moments[0].dancers == (0, 2)
+    assert abs(moments[0].peak - moments[1].peak) >= 1
+    assert len(key_moments(p, np.arange(40) / 10, top_n=1)) == 1
+    assert 'early' not in repr(moments) and 'late' not in repr(moments)
+
+
+@pytest.mark.parametrize('t', [[0, 0, 1], [0, np.nan, 1], [1, 0, 2], [0, 1]])
+def test_key_moments_reject_invalid_timestamps(t):
+    from ddc.coaching import key_moments
+    with pytest.raises(ValueError, match='timestamps'):
+        key_moments(poses(frames=3), t)

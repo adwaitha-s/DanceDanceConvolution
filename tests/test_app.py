@@ -73,20 +73,26 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(app, 'analyze_run', lambda *a, **kw: result)
     outputs = app.run_compare(run.name, ['Person 2', 'Person 4'], 'Auto (on for 3+ dancers)',
                               False, 5, app.REF_DANCER, 'Person 2', None, 0)
-    assert len(outputs) == 12
-    rows, feedback = outputs[4], outputs[-1]
+    assert len(outputs) == 13
+    rows, feedback = outputs[4], outputs[-2]
     assert len(rows) == 1 and rows[0][0] == 'Dancer 2 (Person 4)'
     assert rows[0][1] < 100 and '40/40' in rows[0][2]
     assert 'Overall movement similarity:' in outputs[6]
     assert 'not scored' in outputs[6]
     assert feedback and 'lower' in feedback[0][2]
     assert feedback[0][0] == rows[0][0]
+    key_rows = outputs[-1]
+    assert len(key_rows) == 1
+    assert key_rows[0][0] == 'Dancer 1 (Person 2) & Dancer 2 (Person 4)'
+    assert key_rows[0][4:6] == ['arms', 'left wrist']
+    assert key_rows[0][7] == 17
+    assert app.jump_to_moment(pd.DataFrame(key_rows), type('Event', (), {'index': (0, 0)})()) == key_rows[0][1]
     assert 'left wrist' in app.frame_detail(feedback[0][1])
     event = type('Event', (), {'index': (0, 0)})()
     assert app.jump_to_moment(pd.DataFrame(feedback), event) == feedback[0][1]
     assert len(app.begin_review(None)) == len(app.review_reset_outputs)
     assert len(app.begin_review(run.name)) == len(app.review_reset_outputs)
-    assert app.begin_review(run.name)[-1] == []
+    assert app.begin_review(run.name)[-2:] == ([], [])
 
 
 def test_frame_detail_explains_unavailable_comparison(tmp_path, monkeypatch):
