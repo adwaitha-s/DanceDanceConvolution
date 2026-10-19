@@ -5,6 +5,7 @@ No language model or extra inference is required. Missing comparisons stay NaN.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 
@@ -134,3 +135,77 @@ def feedback_moments(dev, norm, coaching, t, rotate=False, top_n=3, min_sep_s=1.
             j = int(np.nanargmax(coaching.joint[f, d]))
             rows.append([d, float(t[f]), joint_feedback(dev, norm, coaching, f, d, j, t[f], rotate)])
     return sorted(rows, key=lambda row: row[1])
+
+
+@dataclass(frozen=True)
+class KeyMoment:
+    dancers: tuple[int, int]
+    start: float
+    end: float
+    peak: float
+    mean_deviation: float
+    comparable_joints: int
+    region: str
+    joint: str
+
+
+def key_moments(norm, t, top_n=5, min_duration_s=0.25, min_sep_s=1.0):
+    """Rank sustained pairwise pose mismatches, independent of reference choice.
+
+    A candidate needs >= MIN_JOINTS confident joints shared by both dancers and
+    at least one joint differing by NOTICE_DISTANCE. Runs must last 0.25 s;
+    missing comparisons and large timestamp gaps break runs. Rank by the mean
+    shared-joint distance at each run's peak, then keep separated peaks.
+    These are simultaneous 2D pose differences, not evidence of a timing lag.
+    """
+    t = np.asarray(t, dtype=float)
+    if len(t) != len(norm) or not np.isfinite(t).all() or np.any(np.diff(t) <= 0):
+        raise ValueError("key-moment timestamps must be finite, increasing and match pose frames")
+    if min_duration_s < 0 or min_sep_s < 0:
+        raise ValueError("key-moment durations and separation must be nonnegative")
+    if len(t) < 2 or norm.shape[1] < 2 or top_n <= 0:
+        return []
+    observed = (np.isfinite(norm[..., :2]).all(-1) & np.isfinite(norm[..., 2])
+                & (norm[..., 2] >= CONF_THR))
+    gap_limit = max(0.25, 2 * float(np.median(np.diff(t))))
+    candidates = []
+    for a, b in combinations(range(norm.shape[1]), 2):
+        shared = observed[:, a] & observed[:, b]
+        # Mask coordinates before subtraction so invalid observations cannot overflow.
+        xy_a = np.where(shared[..., None], norm[:, a, :, :2], 0.0)
+        xy_b = np.where(shared[..., None], norm[:, b, :, :2], 0.0)
+        distance = np.linalg.norm(xy_a - xy_b, axis=-1)
+        distance[~shared] = np.nan
+        counts = shared.sum(-1)
+        mean = np.full(len(t), np.nan)
+        np.divide(np.nansum(distance, axis=-1), counts, out=mean, where=counts >= MIN_JOINTS)
+        mismatch = ((counts >= MIN_JOINTS)
+                    & np.any(np.where(shared, distance, 0.0) >= NOTICE_DISTANCE, axis=-1))
+        start = None
+        for f in range(len(t) + 1):
+            gap = 0 < f < len(t) and t[f] - t[f - 1] > gap_limit
+            if start is not None and (f == len(t) or not mismatch[f] or gap):
+                end = f - 1
+                if t[end] - t[start] >= min_duration_s:
+                    peak = start + int(np.argmax(mean[start:end + 1]))
+                    j = int(np.nanargmax(distance[peak]))
+                    regions = {}
+                    for name, indices in GROUPS.items():
+                        values = distance[peak, indices]
+                        valid = values[np.isfinite(values)]
+                        if valid.size:
+                            regions[name] = float(valid.mean())
+                    candidates.append(KeyMoment(
+                        (a, b), float(t[start]), float(t[end]), float(t[peak]),
+                        float(mean[peak]), int(counts[peak]),
+                        max(regions, key=regions.get), BODY[j]))
+                start = None
+            if f < len(t) and mismatch[f] and start is None:
+                start = f
+    selected = []
+    for moment in sorted(candidates, key=lambda m: (-m.mean_deviation, m.peak, m.dancers)):
+        if all(abs(moment.peak - other.peak) >= min_sep_s for other in selected):
+            selected.append(moment)
+            if len(selected) >= top_n:
+                break
+    return selected
