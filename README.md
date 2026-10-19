@@ -385,3 +385,30 @@ not proof of good technique. Scores do not evaluate rhythm, artistry or 3D form.
 No additional detector or language-model API calls are needed for coaching.
 
 Run regression tests with `python -m pytest tests -q` in your virtualenv.
+
+#### Key choreography moments to practice
+
+Results also ranks up to five **sustained pairwise pose mismatches**. Each row
+names the dancers, the peak timestamp to click, the time range to review, the
+body region and joint differing most at the peak, the mean joint distance in
+torso lengths, and the number of shared reliable joints. This helps the group
+choose specific sections of choreography to practice. It complements the
+per-dancer personalized feedback and existing Worst moments table.
+
+The detector compares normalized poses directly between each pair of selected
+dancers, independently of the composite/solo reference. Reference dancers can
+participate in these comparisons without receiving a score. A frame requires
+at least six jointly visible, confident joints and at least one distance of
+0.15 torso lengths. A candidate must persist for at least 0.25 seconds; missing
+comparisons and timestamp gaps larger than `max(0.25 seconds, 2 × median frame
+interval)` break a candidate. Candidates are ranked by their peak mean distance
+across shared joints, and reported peaks are at least one second apart. These
+thresholds are review heuristics, not scientifically validated tolerances.
+
+These events identify simultaneous **pose disagreement**, which may be useful
+when reviewing synchronization. They do **not** prove a timing lag or identify
+who is early/late: that would require temporal alignment analysis. Intentional
+choreography differences, perspective and detector errors can also cause pose
+disagreement. An empty table means no qualifying event was found with sufficient
+data; it does not certify perfect synchronization. With only one selected dancer,
+use the existing feedback against the solo reference instead of pairwise events.

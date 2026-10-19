@@ -23,7 +23,7 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
-from ddc.coaching import SCORE_EXPLANATION, feedback_moments, joint_feedback
+from ddc.coaching import SCORE_EXPLANATION, feedback_moments, joint_feedback, key_moments
 from ddc.overlay_cache import render_dancer_overlay
 from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
                                   validate_checklist)
@@ -285,7 +285,7 @@ N_PEOPLE_OUTPUTS = 10   # length of the tuple _show_people returns
 def begin_review(run_name):
     """Jump to step 2 for `run_name` and blank everything left over from another run."""
     if not run_name:
-        return [gr.skip()] * 21
+        return [gr.skip()] * 22
     return (gr.Tabs(selected=TAB_DANCERS),
             f"### {_run_label(RUNS_DIR / run_name)}",
             # step 2
@@ -293,7 +293,7 @@ def begin_review(run_name):
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
             "Finding people...", "", gr.update(interactive=False),
             # step 3
-            NO_RESULT_HINT, None, None, [], [], "", None, "", [])
+            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [])
 
 
 @_friendly("Finding people")
@@ -473,11 +473,15 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     note = f"**Overall movement similarity: {overall_label}** (heuristic).\n\n" + note
     feedback = [[names[d], tm, message] for d, tm, message in
                 feedback_moments(res.dev, res.norm, res.coaching, res.t, res.rotate)]
+    key_rows = [[f"{names[m.dancers[0]]} & {names[m.dancers[1]]}", m.peak,
+                 m.start, m.end, m.region, m.joint.replace("_", " "),
+                 round(m.mean_deviation, 3), m.comparable_joints]
+                for m in key_moments(res.norm, res.t)]
     max_t = float(res.t[-1])
     return (gr.Tabs(selected=TAB_RESULTS), f"### {_run_label(RUNS_DIR / run_name)}",
             res.overlay_path, timeline_figure(res.dev, res.t), rows, moments,
             note + validation_note, res.csv_path, gr.update(maximum=max_t, value=0),
-            frame_detail(0), _review_status(track_choice), feedback)
+            frame_detail(0), _review_status(track_choice), feedback, key_rows)
 
 
 def jump_to_moment(rows, evt: gr.SelectData):
@@ -619,6 +623,21 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                 interactive=False, label="Per-dancer coaching summary (heuristic scores)")
             with gr.Accordion("How scores and feedback work", open=False):
                 gr.Markdown(SCORE_EXPLANATION)
+            gr.Markdown("### Key choreography moments to practice\n"
+                        "Up to five sustained pose mismatches between dancers, ranked by mean "
+                        "pose difference at the peak (torso lengths). Click a row to inspect the peak, "
+                        "then review the listed time range. These can flag moments to check for "
+                        "synchronization, but do not establish who is early or late. Intentional "
+                        "differences in choreography can also appear here.\n\n"
+                        "Requires two dancers sharing at least six reliable joints, with at least "
+                        "one joint differing by 0.15 torso lengths for 0.25 seconds. Reference "
+                        "dancers can be compared here without receiving a score. An empty list "
+                        "means no sustained mismatch was found with enough shared pose data.")
+            key_moments_tbl = gr.Dataframe(
+                headers=["Dancers", "Peak time (s)", "Review from (s)", "Review to (s)",
+                         "Largest region difference", "Joint to review", "Mean pose difference",
+                         "Comparable joints"], interactive=False,
+                label="Priority practice moments — click a row to inspect")
             with gr.Row():
                 with gr.Column(scale=2, elem_id="ddc_video_col"):
                     cmp_video = gr.Video(label="Deviation overlay (green = close, red = far, "
@@ -642,7 +661,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
     people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
                       predicted_overlay, predictor_note, people_headline, review_status, cmp_btn]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
-                      csv_out, detail, feedback_tbl]
+                      csv_out, detail, feedback_tbl, key_moments_tbl]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
 
     demo.load(_runs_update, outputs=run_dd)
@@ -690,7 +709,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                   inputs=[active_run, track_select, loo_choice, rotate, smooth,
                           ref_choice, ref_dancer, solo_video, solo_offset],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
-                           cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl],
+                           cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl,
+                           key_moments_tbl],
                   show_progress_on=cmp_progress
                   ).success(lambda: None, js=_SCROLL_TOP_JS)
     t_slider.change(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
@@ -698,6 +718,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
     ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
     feedback_tbl.select(jump_to_moment, inputs=feedback_tbl, outputs=t_slider
+    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    key_moments_tbl.select(jump_to_moment, inputs=key_moments_tbl, outputs=t_slider
     ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
 
