@@ -73,15 +73,15 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(app, 'analyze_run', lambda *a, **kw: result)
     outputs = app.run_compare(run.name, ['Person 2', 'Person 4'], 'Auto (on for 3+ dancers)',
                               False, 5, app.REF_DANCER, 'Person 2', None, 0)
-    assert len(outputs) == 13
-    rows, feedback = outputs[4], outputs[-2]
+    assert len(outputs) == 16
+    rows, feedback = outputs[4], outputs[11]
     assert len(rows) == 1 and rows[0][0] == 'Dancer 2 (Person 4)'
     assert rows[0][1] < 100 and '40/40' in rows[0][2]
     assert 'Overall movement similarity:' in outputs[6]
     assert 'not scored' in outputs[6]
     assert feedback and 'lower' in feedback[0][2]
     assert feedback[0][0] == rows[0][0]
-    key_rows = outputs[-1]
+    key_rows = outputs[12]
     assert len(key_rows) == 1
     assert key_rows[0][0] == 'Dancer 1 (Person 2) & Dancer 2 (Person 4)'
     assert key_rows[0][4:6] == ['arms', 'left wrist']
@@ -92,7 +92,15 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     assert app.jump_to_moment(pd.DataFrame(feedback), event) == feedback[0][1]
     assert len(app.begin_review(None)) == len(app.review_reset_outputs)
     assert len(app.begin_review(run.name)) == len(app.review_reset_outputs)
-    assert app.begin_review(run.name)[-2:] == ([], [])
+    reset = app.begin_review(run.name)
+    assert reset[-5:-3] == ([], [])
+    assert reset[-3] == '' and reset[-2] == []
+    assert reset[-1]['open'] is False
+    assert outputs[-1]['open'] is False
+    assert 'Movement similarity' in outputs[13]
+    assert outputs[14][0][0] == 'Review left wrist'
+    assert len(outputs[12]) == len(key_rows)  # detailed rows remain available
+    assert app.jump_to_moment(pd.DataFrame(outputs[14]), event) == float(outputs[14][0][1])
 
 
 def test_frame_detail_explains_unavailable_comparison(tmp_path, monkeypatch):
@@ -105,3 +113,38 @@ def test_frame_detail_explains_unavailable_comparison(tmp_path, monkeypatch):
     monkeypatch.setattr(app, '_LAST', {'res': result})
     assert 'insufficient comparable pose data' in app.frame_detail(0)
     assert result.coaching.overall is None
+
+
+def test_overview_handles_missing_scores_and_escapes_dancer_names():
+    from types import SimpleNamespace
+    import app
+
+    res = SimpleNamespace(
+        dev=SimpleNamespace(reference_track=0, mode='dancer'),
+        coaching=SimpleNamespace(overall=None, dancers=[
+            {'reference': True},
+            {'reference': False, 'score': None, 'valid_frames': 0,
+             'total_frames': 100, 'coverage': 0.0},
+        ]),
+    )
+    html = app.results_overview(res, ['Reference <1>', 'Dancer <script>'], [])
+    assert 'N/A' in html and '0/100 comparable frames' in html
+    assert 'Reference &lt;1&gt;' in html and 'Dancer &lt;script&gt;' in html
+    assert '<script>' not in html
+    assert 'Limited pose coverage' in html
+    assert 'No practice moments to show' in html
+    assert html.count('class="ddc-dancer"') == 1  # exclude the reference score
+
+
+def test_practice_preview_limits_initial_feedback_without_discarding_details():
+    import pandas as pd
+    import app
+
+    rows = [['Dancer 1 & Dancer 2', 1.234567 + i, 1., 2., 'arms', 'left wrist', .2, 17]
+            for i in range(5)]
+    preview = app.practice_preview(rows)
+    assert len(preview) == 2 and len(rows) == 5
+    assert preview[0] == ['Review left wrist', '1.23', 'Dancer 1 & Dancer 2']
+    event = type('Event', (), {'index': (0, 0)})()
+    assert app.jump_to_moment(pd.DataFrame(preview), event) == 1.23
+    assert app.practice_preview([]) == []
