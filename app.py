@@ -294,7 +294,7 @@ def begin_review(run_name):
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
             "Finding people...", "", gr.update(interactive=False),
             # step 3
-            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", [], gr.update(open=False))
+            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", "", gr.update(open=False))
 
 
 @_friendly("Finding people")
@@ -416,8 +416,24 @@ def results_overview(res, names, practice_rows):
 
 
 def practice_preview(key_rows):
-    """Keep the initial view short, with human-readable times that still seek correctly."""
-    return [[f"Review {row[5]}", f"{row[1]:.2f}", row[0]] for row in key_rows[:2]]
+    """Render every detected priority moment as an accessible replay card."""
+    if not key_rows:
+        return ('<p class="ddc-empty">No qualifying practice moments found. '
+                'Open detailed feedback to check pose coverage and individual notes.</p>')
+    cards = []
+    for rank, row in enumerate(key_rows, 1):
+        dancers, peak, start, end, region, joint = row[:6]
+        cards.append(
+            f'<li><button type="button" class="ddc-moment" data-ddc-time="{float(peak):.6f}" '
+            f'aria-label="Replay moment {rank}: {escape(str(joint), quote=True)} at {peak:.2f} seconds">'
+            f'<span class="ddc-moment-number">{rank:02d}</span>'
+            f'<span class="ddc-moment-copy"><strong>Review {escape(str(joint))}</strong>'
+            f'<span>{escape(str(dancers))}</span>'
+            f'<span class="ddc-moment-range">{start:.2f}–{end:.2f} s · {escape(str(region))}</span></span>'
+            f'<span class="ddc-moment-play"><span>{peak:.2f} s</span><span aria-hidden="true">↗</span></span>'
+            '</button></li>')
+    return ('<ol class="ddc-moments" aria-label="All priority practice moments">'
+            + ''.join(cards) + '</ol>')
 
 
 @_friendly("Comparison")
@@ -661,12 +677,9 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     t_slider = gr.Slider(0, 1, step=0.05, value=0, label="Inspect time (s)",
                                          elem_id="ddc_t_slider")
                 with gr.Column(scale=2, min_width=280, elem_id="ddc_practice_col"):
-                    gr.Markdown("### Your next focus\n"
-                                "Start with one moment. Click a row to replay it.")
-                    practice_tbl = gr.Dataframe(
-                        headers=["Focus", "Time (s)", "Dancers"], interactive=False,
-                        wrap=True, buttons=[], label="Up to two moments to practice",
-                        elem_id="ddc_practice_preview")
+                    gr.Markdown("### Practice moments\n"
+                                "Every detected priority moment, ranked by pose difference. Choose a card to replay.")
+                    practice_tbl = gr.HTML(elem_id="ddc_practice_preview")
                     gr.Markdown("Pose differences can be intentional. Review the video before "
                                 "deciding what to change.", elem_classes="ddc_small_note")
 
@@ -768,8 +781,6 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
     key_moments_tbl.select(jump_to_moment, inputs=key_moments_tbl, outputs=t_slider
     ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
-    practice_tbl.select(jump_to_moment, inputs=practice_tbl, outputs=t_slider
-    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
 
 # Local fonts, warm paper/ink colors, and restrained accents in both color modes.
@@ -779,63 +790,77 @@ _THEME = gr.themes.Base(
     font_mono=["ui-monospace", "Consolas", "monospace"],
     radius_size="sm",
 ).set(
-    body_background_fill="#f7f5f0", body_background_fill_dark="#1c211e",
-    body_text_color="#252d28", body_text_color_dark="#eeede6",
-    body_text_color_subdued="#68736b", body_text_color_subdued_dark="#b7c0b9",
-    background_fill_primary="#fffefa", background_fill_primary_dark="#252c27",
-    background_fill_secondary="#efede6", background_fill_secondary_dark="#303932",
-    block_background_fill="#fffefa", block_background_fill_dark="#252c27",
-    block_border_color="#dcded3", block_border_color_dark="#424b43",
-    border_color_primary="#dcded3", border_color_primary_dark="#424b43",
-    input_background_fill="#fffefa", input_background_fill_dark="#252c27",
+    body_background_fill="#f5f3ee", body_background_fill_dark="#171a22",
+    body_text_color="#252939", body_text_color_dark="#eeedf5",
+    body_text_color_subdued="#697082", body_text_color_subdued_dark="#b2b6c8",
+    background_fill_primary="#fffefa", background_fill_primary_dark="#222632",
+    background_fill_secondary="#ebeaf1", background_fill_secondary_dark="#2a3040",
+    block_background_fill="#fffefa", block_background_fill_dark="#222632",
+    block_border_color="#dedde5", block_border_color_dark="#3c4254",
+    border_color_primary="#dedde5", border_color_primary_dark="#3c4254",
+    input_background_fill="#fffefa", input_background_fill_dark="#222632",
     block_shadow="none", block_shadow_dark="none",
-    button_primary_background_fill="#344b3e", button_primary_background_fill_dark="#c4d5bf",
-    button_primary_background_fill_hover="#263b30", button_primary_background_fill_hover_dark="#dce6d7",
-    button_primary_text_color="#fffefa", button_primary_text_color_dark="#1c211e",
-    button_primary_border_color="#344b3e", button_primary_border_color_dark="#c4d5bf",
+    button_primary_background_fill="#515d87", button_primary_background_fill_dark="#c3cbed",
+    button_primary_background_fill_hover="#3f4b73", button_primary_background_fill_hover_dark="#dde2fa",
+    button_primary_text_color="#fffefa", button_primary_text_color_dark="#171a22",
+    button_primary_border_color="#515d87", button_primary_border_color_dark="#c3cbed",
     button_primary_shadow="none", button_primary_shadow_dark="none",
 )
 
 _CSS = """
-.gradio-container { max-width: 1160px !important; padding: 36px 28px 56px !important; }
-#ddc_header { margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--border-color-primary); }
-#ddc_header h1 { font-size: clamp(24px, 3vw, 34px); font-weight: 500; letter-spacing: -0.035em; }
+.gradio-container { max-width: 1240px !important; padding: 32px 28px 56px !important; }
+#ddc_header { padding: 24px 28px; margin-bottom: 24px; border: 1px solid var(--border-color-primary); border-radius: 18px; background: var(--background-fill-primary); }
+#ddc_header h1 { font-size: clamp(24px, 3vw, 34px); font-weight: 600; letter-spacing: -0.045em; }
 #ddc_header p, .ddc_small_note p { color: var(--body-text-color-subdued); }
-#ddc_result_title h3 { font-size: 14px; font-weight: 400; color: var(--body-text-color-subdued); margin: 12px 0; }
-#ddc_score_overview { padding: 0; border: 0; background: transparent; }
-.ddc-overview { padding: 24px 0 12px; color: var(--body-text-color); }
-.ddc-overall { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding-bottom: 24px; }
+.tabs > .tab-nav { gap: 8px; padding-bottom: 12px; }
+#ddc_result_title h3 { font-size: 13px; font-weight: 400; color: var(--body-text-color-subdued); margin: 8px 0; }
+#ddc_score_overview, #ddc_practice_preview { padding: 0; border: 0; background: transparent; }
+.ddc-overview { color: var(--body-text-color); display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding: 12px 0 24px; }
+.ddc-overall { padding: 24px; border-radius: 18px; background: var(--button-primary-background-fill); color: var(--button-primary-text-color); display: flex; flex-direction: column; justify-content: space-between; gap: 16px; }
 .ddc-overview p, .ddc-overview h3 { margin: 0; }
-.ddc-overview .ddc-eyebrow { color: var(--body-text-color-subdued); font-size: 13px; letter-spacing: 0.06em; }
-.ddc-overall-score { font-size: clamp(44px, 7vw, 68px); font-weight: 500; line-height: 1.2; letter-spacing: -0.055em; font-variant-numeric: tabular-nums; }
-.ddc-overall-score span, .ddc-dancer-score span { font-size: 15px; font-weight: 400; color: var(--body-text-color-subdued); letter-spacing: 0; }
-.ddc-score-context { max-width: 390px; font-size: 14px; line-height: 1.7; }
-.ddc-overview .ddc-muted { color: var(--body-text-color-subdued); font-size: 12px; line-height: 1.7; }
-.ddc-dancer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); border-top: 1px solid var(--border-color-primary); padding: 18px 0; gap: 20px; }
-.ddc-dancer h3 { font-size: 14px; font-weight: 500; }
-.ddc-dancer-score { font-size: 28px; line-height: 1.5; letter-spacing: -0.025em; }
-.ddc-overview .ddc-coverage-note { padding: 12px 0; font-size: 13px; font-weight: 500; }
-#ddc_practice_row { gap: 28px; align-items: flex-start; margin-top: 4px; }
-#ddc_practice_col { padding: 8px 0; gap: 18px; }
-#ddc_practice_col h3, #ddc_details h3 { font-size: 20px; font-weight: 500; letter-spacing: -0.02em; }
-#ddc_practice_col p { font-size: 14px; }
+.ddc-overview .ddc-overall p, .ddc-overview .ddc-overall span { color: var(--button-primary-text-color) !important; }
+.ddc-eyebrow { font-size: 12px; letter-spacing: .09em; text-transform: uppercase; }
+.ddc-overall-score { font-size: clamp(48px, 7vw, 72px); font-weight: 500; line-height: 1.2; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+.ddc-overall-score span, .ddc-dancer-score span { font-size: 14px; font-weight: 400; letter-spacing: 0; opacity: .75; }
+.ddc-score-context { font-size: 13px; line-height: 1.65; }
+.ddc-overview .ddc-muted { font-size: 12px; line-height: 1.7; opacity: .8; }
+.ddc-dancer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 12px; }
+.ddc-dancer { padding: 20px; border: 1px solid var(--border-color-primary); border-radius: 18px; background: var(--background-fill-primary); }
+.ddc-dancer h3 { font-size: 13px; font-weight: 500; }
+.ddc-dancer-score { font-size: 32px; line-height: 1.8; letter-spacing: -.035em; }
+.ddc-overview > .ddc-coverage-note, .ddc-overview > .ddc-muted { grid-column: 1 / -1; }
+#ddc_practice_row { gap: 24px; align-items: flex-start; }
+#ddc_practice_col { gap: 14px; }
+#ddc_practice_col h3, #ddc_details h3 { font-size: 21px; font-weight: 600; letter-spacing: -.035em; }
+#ddc_practice_col p { font-size: 13px; line-height: 1.65; }
 .ddc_small_note p { font-size: 12px !important; line-height: 1.65; }
+.ddc-moments { list-style: none !important; margin: 0 !important; padding: 0 !important; display: grid; gap: 10px; }
+.ddc-moment { width: 100%; display: flex; align-items: flex-start; gap: 14px; padding: 18px; text-align: left; color: var(--body-text-color); background: var(--background-fill-primary); border: 1px solid var(--border-color-primary); border-radius: 16px; cursor: pointer; transition: border-color .15s, background .15s; font: inherit; }
+.ddc-moment:hover { border-color: var(--button-primary-background-fill); background: var(--background-fill-secondary); }
+.ddc-moment:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
+.ddc-moment-number { font-size: 12px; color: var(--body-text-color-subdued); padding-top: 3px; font-variant-numeric: tabular-nums; }
+.ddc-moment-copy { display: grid; gap: 6px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ddc-moment-copy strong { font-size: 15px; font-weight: 600; }
+.ddc-moment-copy > span { font-size: 12px; color: var(--body-text-color-subdued); line-height: 1.5; }
+.ddc-moment-range { font-variant-numeric: tabular-nums; }
+.ddc-moment-play { display: grid; gap: 12px; justify-items: end; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ddc-moment-play > span:last-child { font-size: 20px; }
+.ddc-empty { padding: 20px; border: 1px dashed var(--border-color-primary); border-radius: 16px; color: var(--body-text-color-subdued); }
+#ddc_cmp_video { border-radius: 18px; overflow: hidden; }
 #ddc_cmp_video video { max-height: 58vh; width: 100%; object-fit: contain; }
 #ddc_pred_video video, #ddc_in_video video { max-height: 60vh; object-fit: contain; }
 #ddc_video_col { position: sticky; top: 12px; align-self: flex-start; }
-#ddc_details { margin-top: 24px; border: 1px solid var(--border-color-primary); border-radius: 8px; }
-#ddc_details > button { padding: 18px 20px; font-size: 15px; }
+#ddc_details { margin-top: 24px; border: 1px solid var(--border-color-primary); border-radius: 16px; }
+#ddc_details > button { padding: 20px; font-size: 15px; }
 #ddc_details > button:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
-#ddc_timeline .ddc-playhead {
-  position: absolute; width: 2px; margin-left: -1px; background: #687d62; opacity: .85;
-  pointer-events: none; z-index: 5; display: none;
-}
+#ddc_timeline .ddc-playhead { position: absolute; width: 2px; margin-left: -1px; background: #8895c5; opacity: .85; pointer-events: none; z-index: 5; display: none; }
 @media (max-width: 700px) {
-  .gradio-container { padding: 24px 16px 40px !important; }
-  .ddc-overall { flex-direction: column; align-items: flex-start; gap: 12px; }
-  .ddc-score-context { max-width: none; }
+  .gradio-container { padding: 20px 16px 40px !important; }
+  #ddc_header { padding: 20px; }
+  .ddc-overview { grid-template-columns: 1fr; }
+  .ddc-overall { padding: 22px; }
   #ddc_video_col { position: static; }
-  #ddc_practice_row { gap: 12px; }
+  #ddc_practice_row { gap: 16px; }
 }
 """
 
@@ -879,6 +904,15 @@ _SYNC_JS = """
     input.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
     input.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
   }
+
+  document.addEventListener('click', (event) => {
+    const card = event.target.closest?.('button[data-ddc-time]');
+    if (!card || !card.closest('#ddc_practice_preview')) return;
+    const t = Number(card.dataset.ddcTime);
+    if (!Number.isFinite(t) || t < 0) return;
+    window.ddcSeek(t);
+    setSlider(t);
+  });
 
   function drawPlayhead() {
     const gd = plot(), v = video();

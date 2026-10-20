@@ -416,13 +416,14 @@ use the existing feedback against the solo reference instead of pairwise events.
 #### A quieter Results view
 
 Results opens with movement-similarity scores, comparable-frame coverage, the
-video overlay, and at most two suggested practice moments. Click a suggested
+video overlay, and every detected priority practice moment (up to five), presented
+as replay cards with the dancers, joint, peak timestamp, and practice range. Click a suggested
 moment to seek the video, or move **Inspect time**. **View detailed feedback**
 expands the timeline, strengths and improvement areas, all priority moments,
 worst moments, timestamped joint suggestions, the scoring explanation, and CSV
 export. The detail panel closes whenever you compare again or open another run,
 so each session starts with the short overview. No analysis data is discarded.
 
-The interface uses local system fonts, warm paper/ink colors, restrained sage
+The interface uses local system fonts, ivory and graphite colors, muted indigo
 accents, and a responsive layout with light and dark color modes. Scores,
 comparison rules, and pose analysis are unchanged.
