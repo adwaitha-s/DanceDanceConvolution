@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import time
+from html import escape
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,7 @@ import gradio as gr
 import numpy as np
 
 from ddc.analyze import _save_source_video, analyze_run, detect_tracks
+from ddc.coaching import SCORE_EXPLANATION, feedback_moments, joint_feedback, key_moments
 from ddc.overlay_cache import render_dancer_overlay
 from ddc.feature_registry import (predict_run, rebuild_registry_workbook,
                                   validate_checklist)
@@ -284,7 +286,7 @@ N_PEOPLE_OUTPUTS = 10   # length of the tuple _show_people returns
 def begin_review(run_name):
     """Jump to step 2 for `run_name` and blank everything left over from another run."""
     if not run_name:
-        return [gr.skip()] * 20
+        return [gr.skip()] * 28
     return (gr.Tabs(selected=TAB_DANCERS),
             f"### {_run_label(RUNS_DIR / run_name)}",
             # step 2
@@ -292,7 +294,9 @@ def begin_review(run_name):
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
             "Finding people...", "", gr.update(interactive=False),
             # step 3
-            NO_RESULT_HINT, None, None, [], [], "", None, "")
+            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", "", gr.update(open=False),
+            gr.update(choices=["All dancers"], value="All dancers"), "",
+            gr.update(value=None, visible=False))
 
 
 @_friendly("Finding people")
@@ -384,6 +388,56 @@ def save_review(run_name, track_choice, progress=gr.Progress()):
             f"Updated {workbook.name}.")
 
 
+def results_overview(res, names, practice_rows):
+    """A small, escaped score summary; the full analysis stays in the detail panel."""
+    score = f"{res.coaching.overall:.1f}" if res.coaching.overall is not None else "N/A"
+    ref = res.dev.reference_track
+    reference = (f"Reference: {names[ref]} · not scored" if ref is not None else
+                 "Compared with the solo reference" if res.dev.mode == "solo" else
+                 "Compared with the group · differences do not establish who is correct")
+    cards = []
+    for name, dancer in zip(names, res.coaching.dancers):
+        if dancer["reference"]:
+            continue
+        value = f'{dancer["score"]:.1f}' if dancer["score"] is not None else "N/A"
+        coverage = f'{dancer["valid_frames"]}/{dancer["total_frames"]} comparable frames'
+        cards.append(f'<div class="ddc-dancer"><h3>{escape(name)}</h3>'
+                     f'<p class="ddc-dancer-score">{value}<span> / 100</span></p>'
+                     f'<p class="ddc-muted">{coverage}</p></div>')
+    note = ""
+    if any(d["coverage"] < 0.5 for d in res.coaching.dancers if not d["reference"]):
+        note += '<p class="ddc-coverage-note">Limited pose coverage. Open detailed feedback before interpreting these scores.</p>'
+    if not practice_rows:
+        note += '<p class="ddc-muted">No practice moments to show. Detailed feedback includes pose coverage and individual joint notes.</p>'
+    return (f'<section class="ddc-overview" aria-label="Movement similarity overview">'
+            f'<div class="ddc-overall"><div><p class="ddc-eyebrow">Movement similarity</p>'
+            f'<p class="ddc-overall-score">{score}<span> / 100</span></p></div>'
+            f'<div class="ddc-score-context"><p>{escape(reference)}</p>'
+            f'<p class="ddc-muted">A practice guide, not a validated accuracy percentage.</p></div></div>'
+            f'<div class="ddc-dancer-grid">{"".join(cards)}</div>{note}</section>')
+
+
+def practice_preview(key_rows):
+    """Render every detected priority moment as an accessible replay card."""
+    if not key_rows:
+        return ('<p class="ddc-empty">No qualifying practice moments found. '
+                'Open detailed feedback to check pose coverage and individual notes.</p>')
+    cards = []
+    for rank, row in enumerate(key_rows, 1):
+        dancers, peak, start, end, region, joint = row[:6]
+        cards.append(
+            f'<li><button type="button" class="ddc-moment" data-ddc-time="{float(peak):.6f}" '
+            f'aria-label="Replay moment {rank}: {escape(str(joint), quote=True)} at {peak:.2f} seconds">'
+            f'<span class="ddc-moment-number">{rank:02d}</span>'
+            f'<span class="ddc-moment-copy"><strong>Review {escape(str(joint))}</strong>'
+            f'<span>{escape(str(dancers))}</span>'
+            f'<span class="ddc-moment-range">{start:.2f}–{end:.2f} s · {escape(str(region))}</span></span>'
+            f'<span class="ddc-moment-play"><span>{peak:.2f} s</span><span aria-hidden="true">↗</span></span>'
+            '</button></li>')
+    return ('<ol class="ddc-moments" aria-label="All priority practice moments">'
+            + ''.join(cards) + '</ol>')
+
+
 @_friendly("Comparison")
 def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
                 ref_choice, ref_dancer, solo_video, solo_offset, progress=gr.Progress()):
@@ -448,11 +502,16 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     names = [f"Dancer {d + 1} ({p})" if renumbered else f"Dancer {d + 1}"
              for d, p in enumerate(people)]
 
+    _LAST["names"] = names
     rows, moments = [], []
     for d, s in enumerate(res.summary):
         if d == res.dev.reference_track:
             continue
-        rows.append([names[d], s["frames_present"], round(s["mean_dev"], 3), s["worst_joint"]])
+        c = res.coaching.dancers[d]
+        rows.append([names[d], round(c["score"], 1) if c["score"] is not None else "N/A",
+                     f'{c["valid_frames"]}/{c["total_frames"]} ({c["coverage"]:.0%})',
+                     round(s["mean_dev"], 3) if np.isfinite(s["mean_dev"]) else "N/A",
+                     c["strength"], c["improvement"]])
         moments += [[names[d], t, joint, score] for t, score, joint in s["worst_moments"]]
     moments.sort(key=lambda m: -m[3])
 
@@ -462,11 +521,144 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     if res.n_tracks == 2 and mode == "composite":
         note = ("Only 2 dancers: the composite is their midpoint, so deviation is symmetric "
                 "(it measures how far apart they are, not who is off).")
+    overall = res.coaching.overall
+    overall_label = f"{overall:.1f}/100" if overall is not None else "N/A — insufficient comparable pose data"
+    note = f"**Overall movement similarity: {overall_label}** (heuristic).\n\n" + note
+    feedback = [[names[d], tm, message] for d, tm, message in
+                feedback_moments(res.dev, res.norm, res.coaching, res.t, res.rotate)]
+    try:
+        priority = key_moments(res.norm, res.t)
+    except ValueError as e:
+        # Practice moments are an extra; bad timestamps shouldn't sink the whole result.
+        priority = []
+        note += f"\n\nPractice moments unavailable: {e}."
+    key_rows = [[f"{names[m.dancers[0]]} & {names[m.dancers[1]]}", m.peak,
+                 m.start, m.end, m.region, m.joint.replace("_", " "),
+                 round(m.mean_deviation, 3), m.comparable_joints]
+                for m in priority]
+    _LAST["report_rows"] = (rows, moments, feedback, key_rows)
+    _LAST["report_pairs"] = [tuple(names[d] for d in m.dancers) for m in priority]
     max_t = float(res.t[-1])
     return (gr.Tabs(selected=TAB_RESULTS), f"### {_run_label(RUNS_DIR / run_name)}",
             res.overlay_path, timeline_figure(res.dev, res.t), rows, moments,
             note + validation_note, res.csv_path, gr.update(maximum=max_t, value=0),
-            frame_detail(0), _review_status(track_choice))
+            frame_detail(0), _review_status(track_choice), feedback, key_rows,
+            results_overview(res, names, key_rows), practice_preview(key_rows), gr.update(open=False),
+            gr.update(choices=["All dancers"] + names, value="All dancers"),
+            dancer_report("All dancers"), gr.update(value=None, visible=False))
+
+
+def dancer_report(dancer):
+    """Readable individual report without implying that reference dancers are scored."""
+    names = _LAST.get("names", [])
+    if dancer == "All dancers":
+        return '<p class="ddc-empty">Choose a dancer above to open their individual report.</p>'
+    if dancer not in names or _LAST.get("res") is None:
+        return '<p class="ddc-empty">Compare dancers to load an individual report.</p>'
+    c = _LAST["res"].coaching.dancers[names.index(dancer)]
+    if c["reference"]:
+        body = '<p>Reference dancer · not scored. Pairwise practice moments involving this dancer are listed below.</p>'
+    else:
+        score = f'{c["score"]:.1f} / 100' if c["score"] is not None else 'N/A · insufficient comparable pose data'
+        body = (f'<p class="ddc-dancer-score">{score}</p>'
+                f'<p>{c["valid_frames"]}/{c["total_frames"]} comparable frames ({c["coverage"]:.0%})</p>'
+                f'<p><strong>Strength / closest region:</strong> {escape(c["strength"])}</p>'
+                f'<p><strong>Area to review:</strong> {escape(c["improvement"])}</p>'
+                '<p class="ddc-muted">Movement similarity is a heuristic, not a validated accuracy percentage.</p>')
+        if c["coverage"] < .5:
+            body += '<p>Limited pose coverage; interpret this score cautiously.</p>'
+    return f'<section class="ddc-dancer" aria-label="Individual dancer report"><h3>{escape(dancer)}</h3>{body}</section>'
+
+
+def _report_rows(dancer):
+    """(summary, worst moments, feedback, priority moments) rows for `dancer`, or for everyone."""
+    rows, moments, feedback, priority = _LAST.get("report_rows", ([], [], [], []))
+    if dancer != "All dancers":
+        rows, moments, feedback = ([r for r in table if r[0] == dancer]
+                                  for table in (rows, moments, feedback))
+        priority = [r for r, pair in zip(priority, _LAST.get("report_pairs", []))
+                    if dancer in pair]
+    return rows, moments, feedback, priority
+
+
+_REPORT_CSS = """
+body { font: 15px/1.6 system-ui, sans-serif; color: #252939; background: #fffefa;
+       max-width: 760px; margin: 40px auto; padding: 0 20px; }
+h1 { font-size: 26px; margin-bottom: 4px; } h2 { font-size: 18px; margin-top: 32px; }
+.muted { color: #697082; font-size: 13px; }
+.score { font-size: 44px; font-weight: 600; margin: 16px 0 0; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #dedde5; vertical-align: top; }
+th { color: #697082; font-weight: 500; }
+"""
+
+
+def _html_table(headers, rows):
+    head = "".join(f"<th>{escape(h)}</th>" for h in headers)
+    body = "".join("<tr>" + "".join(f"<td>{escape(str(v))}</td>" for v in row) + "</tr>"
+                   for row in rows)
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def dancer_report_file(dancer):
+    """Write the selected dancer's report as a standalone HTML page in the run folder.
+
+    Returns its path, or None for "All dancers" / before a comparison. Practice moments
+    and worst moments are rounded for reading; the CSV keeps the full-precision data.
+    """
+    res, names = _LAST.get("res"), _LAST.get("names", [])
+    if res is None or dancer == "All dancers" or dancer not in names:
+        return None
+    c = res.coaching.dancers[names.index(dancer)]
+    _, moments, feedback, priority = _report_rows(dancer)
+    parts = [f"<h1>{escape(dancer)}</h1>",
+             f'<p class="muted">{escape(_run_label(res.run_dir))} · generated '
+             f'{time.strftime("%b %d %Y %H:%M")}</p>']
+    if c["reference"]:
+        parts.append("<p>Reference dancer · not scored. Practice moments involving this "
+                     "dancer are listed below.</p>")
+    else:
+        score = f'{c["score"]:.1f} / 100' if c["score"] is not None else "N/A"
+        parts += [f'<p class="score">{score}</p>',
+                  f'<p class="muted">Movement similarity · {c["valid_frames"]}/{c["total_frames"]} '
+                  f'comparable frames ({c["coverage"]:.0%})</p>',
+                  f'<p><strong>Strength / closest region:</strong> {escape(c["strength"])}</p>',
+                  f'<p><strong>Area to review:</strong> {escape(c["improvement"])}</p>']
+        if c["coverage"] < .5:
+            parts.append("<p>Limited pose coverage; interpret this score cautiously.</p>")
+    parts += ["<h2>Personalized feedback</h2>",
+              _html_table(["Time (s)", "Suggestion"], [[f"{tm:.2f}", msg] for _, tm, msg in feedback])
+              if feedback else '<p class="muted">No substantial differences found.</p>',
+              "<h2>Practice moments</h2>",
+              _html_table(["Dancers", "Peak (s)", "Review range (s)", "Region", "Joint"],
+                          [[r[0], f"{r[1]:.2f}", f"{r[2]:.2f}–{r[3]:.2f}", r[4], r[5]]
+                           for r in priority])
+              if priority else '<p class="muted">No qualifying practice moments.</p>',
+              "<h2>Worst moments</h2>",
+              _html_table(["Time (s)", "Joint", "Deviation (torso lengths)"],
+                          [[f"{tm:.2f}", j, f"{s:.2f}"] for _, tm, j, s in moments])
+              if moments else '<p class="muted">None.</p>',
+              f'<h2>About these scores</h2><p class="muted">{escape(SCORE_EXPLANATION)}</p>']
+    slug = "".join(ch if ch.isalnum() else "-" for ch in dancer.lower()).strip("-")
+    path = res.run_dir / "reports" / f"{slug}.html"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+                    f"<title>{escape(dancer)} · dance feedback</title><style>{_REPORT_CSS}</style>"
+                    f"</head><body>{''.join(parts)}</body></html>", encoding="utf-8")
+    return str(path)
+
+
+def _report_download(dancer):
+    path = dancer_report_file(dancer)
+    return gr.update(value=path, visible=path is not None)
+
+
+def filter_dancer_report(dancer, t_sec):
+    """Filter by exact dancer identity, keeping the cached full analysis intact."""
+    rows, moments, feedback, priority = _report_rows(dancer)
+    return (rows, moments, feedback, priority, frame_detail(t_sec, dancer), dancer_report(dancer),
+            _report_download(dancer))
 
 
 def jump_to_moment(rows, evt: gr.SelectData):
@@ -474,29 +666,38 @@ def jump_to_moment(rows, evt: gr.SelectData):
     return float(rows.iloc[evt.index[0], 1])
 
 
-def frame_detail(t_sec):
+def frame_detail(t_sec, dancer="All dancers"):
     res = _LAST.get("res")
     if res is None:
         return "Run an analysis first."
     f = int(np.argmin(np.abs(res.t - t_sec)))
     lines = [f"t={res.t[f]:.2f}s (frame {f}), {int(res.dev.n_present[f])} dancer(s) present"]
+    names = _LAST.get("names", [f"Dancer {i + 1}" for i in range(res.n_tracks)])
     for d in range(res.n_tracks):
+        if dancer != "All dancers" and names[d] != dancer:
+            continue
         if d == res.dev.reference_track:
-            lines.append(f"Dancer {d + 1}: reference")
+            lines.append(f"{names[d]}: reference (not scored)")
             continue
-        j = res.dev.joint[f, d]
+        name = names[d]
+        j = res.coaching.joint[f, d]
         if not np.isfinite(j).any():
-            lines.append(f"Dancer {d + 1}: not visible")
+            lines.append(f"{name}: insufficient comparable pose data (dancer or reference missing, "
+                         "too few reliable joints, or no peer for the composite).")
             continue
-        top = np.argsort(-np.nan_to_num(j, nan=-1))[:3]
-        lines.append(f"Dancer {d + 1}: score {res.dev.score[f, d]:.2f}; worst: " +
-                     ", ".join(f"{BODY[i]} {j[i]:.2f}" for i in top))
+        score = res.coaching.frame_score[f, d]
+        lines.append(f"{name}: movement similarity {score:.1f}/100; "
+                     f"deviation {res.coaching.deviation[f, d]:.2f} torso lengths.")
+        top = np.flatnonzero(np.isfinite(j))
+        top = top[np.argsort(-j[top])][:3]
+        lines.extend(joint_feedback(res.dev, res.norm, res.coaching, f, d, i, res.t[f], res.rotate)
+                     for i in top)
     return "\n".join(lines)
 
 
 # Runs in the browser before `frame_detail`: any change of the time slider (dragging it,
 # clicking a worst-moment row) also moves the video. `ddcSeek` is defined in _SYNC_JS.
-_SEEK_ON_SLIDER_JS = "(t) => { if (window.ddcSeek) window.ddcSeek(t); return t; }"
+_SEEK_ON_SLIDER_JS = "(t, dancer) => { if (window.ddcSeek) window.ddcSeek(t); return [t, dancer]; }"
 # Each step starts at the top of the page, not wherever the previous step was scrolled to.
 _SCROLL_TOP_JS = "() => { window.scrollTo({top: 0, behavior: 'smooth'}); }"
 _SCROLL_TOP_JS_KEEP = "(run) => { window.scrollTo({top: 0, behavior: 'smooth'}); return run; }"
@@ -505,7 +706,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
     active_run = gr.State(None)   # the run steps 2 and 3 are working on
 
     gr.Markdown("# DanceDanceConvolution\n"
-                "See how closely each dancer matches the group, frame by frame.")
+                "A clearer view of your movement. A little more focus for your next practice.",
+                elem_id="ddc_header")
     with gr.Tabs() as tabs:
         with gr.Tab("1 · Video", id=TAB_VIDEO):
             with gr.Row():
@@ -594,33 +796,68 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
             cmp_progress = gr.Markdown(min_height=40)   # where the Compare progress bar shows
 
         with gr.Tab("3 · Results", id=TAB_RESULTS):
-            result_title = gr.Markdown(NO_RESULT_HINT)
-            with gr.Row():
-                with gr.Column(scale=2, elem_id="ddc_video_col"):
-                    cmp_video = gr.Video(label="Deviation overlay (green = close, red = far, "
-                                               "white ghost = reference)",
+            result_title = gr.Markdown(NO_RESULT_HINT, elem_id="ddc_result_title")
+            overview = gr.HTML(elem_id="ddc_score_overview")
+            with gr.Row(elem_id="ddc_practice_row"):
+                with gr.Column(scale=3, elem_id="ddc_video_col"):
+                    cmp_video = gr.Video(label="Your movement · green = close, red = different",
                                          elem_id="ddc_cmp_video")
-                with gr.Column(scale=3):
-                    timeline = gr.Plot(label="Timeline -- click anywhere to jump the video there",
-                                       elem_id="ddc_timeline")
                     t_slider = gr.Slider(0, 1, step=0.05, value=0, label="Inspect time (s)",
                                          elem_id="ddc_t_slider")
-            with gr.Row():
-                detail = gr.Textbox(label="At this moment", lines=5, scale=2)
+                with gr.Column(scale=2, min_width=280, elem_id="ddc_practice_col"):
+                    gr.Markdown("### Practice moments\n"
+                                "Every detected priority moment, ranked by pose difference. Choose a card to replay.")
+                    practice_tbl = gr.HTML(elem_id="ddc_practice_preview")
+                    gr.Markdown("Pose differences can be intentional. Review the video before "
+                                "deciding what to change.", elem_classes="ddc_small_note")
+
+            with gr.Accordion("View detailed feedback", open=False, elem_id="ddc_details") as details_panel:
+                gr.Markdown("### A closer look\n"
+                            "Explore each dancer, compare moments, or download the full analysis.")
+                with gr.Row(equal_height=True):
+                    report_dancer = gr.Dropdown(["All dancers"], value="All dancers",
+                                                label="Feedback report for", interactive=True,
+                                                scale=3)
+                    report_download = gr.DownloadButton("Download report", visible=False,
+                                                        scale=1)
+                individual_report = gr.HTML()
+                cmp_note = gr.Markdown()
+                summary_tbl = gr.Dataframe(
+                    headers=["Dancer", "Similarity / 100", "Comparable frames", "Mean raw deviation",
+                             "Strength / closest region", "Area to review"],
+                    interactive=False, wrap=True, label="Per-dancer coaching summary (heuristic scores)",
+                    # Fixed widths for the short numeric columns so wrapping only hits the prose.
+                    column_widths=["14%", "12%", "14%", "12%", "24%", "24%"])
+                timeline = gr.Plot(label="Group timeline (all dancers) — click to inspect a moment", elem_id="ddc_timeline")
+                detail = gr.Textbox(label="At this moment", lines=6)
+                gr.Markdown("### Priority practice moments for the selected dancer\n"
+                            "Up to five sustained pairwise pose differences, ranked by peak mean "
+                            "deviation. The review range gives you the surrounding section to practice. "
+                            "These do not establish who is early or late.")
+                key_moments_tbl = gr.Dataframe(
+                    headers=["Dancers", "Peak time (s)", "Review from (s)", "Review to (s)",
+                             "Largest region difference", "Joint to review", "Mean pose difference",
+                             "Comparable joints"], interactive=False,
+                    label="Priority practice moments — click a row to inspect")
                 moments_tbl = gr.Dataframe(
                     headers=["Dancer", "Time (s)", "Joint", "Deviation"], interactive=False,
-                    label="Worst moments -- click a row to jump there", scale=3)
-            cmp_note = gr.Markdown()
-            with gr.Row():
-                summary_tbl = gr.Dataframe(
-                    headers=["Dancer", "Frames present", "Mean deviation", "Worst joint"],
-                    interactive=False, label="Per-dancer summary", scale=3)
-                csv_out = gr.File(label="Per-frame deviation CSV", scale=2)
+                    label="Worst moments — click a row to inspect")
+                feedback_tbl = gr.Dataframe(
+                    headers=["Dancer", "Time (s)", "Suggestion"], interactive=False, wrap=True,
+                    label="Personalized feedback — click a row to inspect")
+                with gr.Accordion("How scores and feedback work", open=False):
+                    gr.Markdown(SCORE_EXPLANATION)
+                    gr.Markdown("Priority moments need two dancers sharing at least six reliable "
+                                "joints, with at least one differing by 0.15 torso lengths for 0.25 "
+                                "seconds. Reference dancers can be compared without receiving a score. "
+                                "An empty list means no qualifying event was found with enough data; "
+                                "it does not certify synchronization.")
+                csv_out = gr.File(label="Download full group per-frame analysis · CSV")
 
     people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
                       predicted_overlay, predictor_note, people_headline, review_status, cmp_btn]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
-                      csv_out, detail]
+                      csv_out, detail, feedback_tbl, key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
 
     demo.load(_runs_update, outputs=run_dd)
@@ -668,23 +905,102 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                   inputs=[active_run, track_select, loo_choice, rotate, smooth,
                           ref_choice, ref_dancer, solo_video, solo_offset],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
-                           cmp_note, csv_out, t_slider, detail, review_status],
+                           cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl,
+                           key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download],
                   show_progress_on=cmp_progress
                   ).success(lambda: None, js=_SCROLL_TOP_JS)
-    t_slider.change(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    report_dancer.change(filter_dancer_report, inputs=[report_dancer, t_slider],
+                         outputs=[summary_tbl, moments_tbl, feedback_tbl, key_moments_tbl,
+                                  detail, individual_report, report_download])
+    t_slider.change(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
     moments_tbl.select(jump_to_moment, inputs=moments_tbl, outputs=t_slider
-    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
+
+    feedback_tbl.select(jump_to_moment, inputs=feedback_tbl, outputs=t_slider
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    key_moments_tbl.select(jump_to_moment, inputs=key_moments_tbl, outputs=t_slider
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
 
-# The results video sits beside the timeline and must never be taller than the window,
-# whatever the clip's aspect ratio; it stays put if the right-hand column scrolls.
+
+# Local fonts, warm paper/ink colors, and restrained accents in both color modes.
+_THEME = gr.themes.Base(
+    primary_hue="stone", secondary_hue="stone", neutral_hue="stone",
+    font=["ui-sans-serif", "system-ui", "sans-serif"],
+    font_mono=["ui-monospace", "Consolas", "monospace"],
+    radius_size="sm",
+).set(
+    body_background_fill="#f5f3ee", body_background_fill_dark="#171a22",
+    body_text_color="#252939", body_text_color_dark="#eeedf5",
+    body_text_color_subdued="#697082", body_text_color_subdued_dark="#b2b6c8",
+    background_fill_primary="#fffefa", background_fill_primary_dark="#222632",
+    background_fill_secondary="#ebeaf1", background_fill_secondary_dark="#2a3040",
+    block_background_fill="#fffefa", block_background_fill_dark="#222632",
+    block_border_color="#dedde5", block_border_color_dark="#3c4254",
+    border_color_primary="#dedde5", border_color_primary_dark="#3c4254",
+    input_background_fill="#fffefa", input_background_fill_dark="#222632",
+    block_shadow="none", block_shadow_dark="none",
+    button_primary_background_fill="#515d87", button_primary_background_fill_dark="#c3cbed",
+    button_primary_background_fill_hover="#3f4b73", button_primary_background_fill_hover_dark="#dde2fa",
+    button_primary_text_color="#fffefa", button_primary_text_color_dark="#171a22",
+    button_primary_border_color="#515d87", button_primary_border_color_dark="#c3cbed",
+    button_primary_shadow="none", button_primary_shadow_dark="none",
+)
+
 _CSS = """
-#ddc_cmp_video video { max-height: 72vh; width: 100%; object-fit: contain; }
+.gradio-container { max-width: 1240px !important; padding: 32px 28px 56px !important; }
+#ddc_header { padding: 24px 28px; margin-bottom: 24px; border: 1px solid var(--border-color-primary); border-radius: 18px; background: var(--background-fill-primary); }
+#ddc_header h1 { font-size: clamp(24px, 3vw, 34px); font-weight: 600; letter-spacing: -0.045em; }
+#ddc_header p, .ddc_small_note p { color: var(--body-text-color-subdued); }
+.tabs > .tab-nav { gap: 8px; padding-bottom: 12px; }
+#ddc_result_title h3 { font-size: 13px; font-weight: 400; color: var(--body-text-color-subdued); margin: 8px 0; }
+#ddc_score_overview, #ddc_practice_preview { padding: 0; border: 0; background: transparent; }
+.ddc-overview { color: var(--body-text-color); display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding: 12px 0 24px; }
+.ddc-overall { padding: 24px; border-radius: 18px; background: var(--button-primary-background-fill); color: var(--button-primary-text-color); display: flex; flex-direction: column; justify-content: space-between; gap: 16px; }
+.ddc-overview p, .ddc-overview h3 { margin: 0; }
+.ddc-overview .ddc-overall p, .ddc-overview .ddc-overall span { color: var(--button-primary-text-color) !important; }
+.ddc-eyebrow { font-size: 12px; letter-spacing: .09em; text-transform: uppercase; }
+.ddc-overall-score { font-size: clamp(48px, 7vw, 72px); font-weight: 500; line-height: 1.2; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+.ddc-overall-score span, .ddc-dancer-score span { font-size: 14px; font-weight: 400; letter-spacing: 0; opacity: .75; }
+.ddc-score-context { font-size: 13px; line-height: 1.65; }
+.ddc-overview .ddc-muted { font-size: 12px; line-height: 1.7; opacity: .8; }
+.ddc-dancer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 12px; }
+.ddc-dancer { padding: 20px; border: 1px solid var(--border-color-primary); border-radius: 18px; background: var(--background-fill-primary); }
+.ddc-dancer h3 { font-size: 13px; font-weight: 500; }
+.ddc-dancer-score { font-size: 32px; line-height: 1.8; letter-spacing: -.035em; }
+.ddc-overview > .ddc-coverage-note, .ddc-overview > .ddc-muted { grid-column: 1 / -1; }
+#ddc_practice_row { gap: 24px; align-items: flex-start; }
+#ddc_practice_col { gap: 14px; }
+#ddc_practice_col h3, #ddc_details h3 { font-size: 21px; font-weight: 600; letter-spacing: -.035em; }
+#ddc_practice_col p { font-size: 13px; line-height: 1.65; }
+.ddc_small_note p { font-size: 12px !important; line-height: 1.65; }
+.ddc-moments { list-style: none !important; margin: 0 !important; padding: 0 !important; display: grid; gap: 10px; }
+.ddc-moment { width: 100%; display: flex; align-items: flex-start; gap: 14px; padding: 18px; text-align: left; color: var(--body-text-color); background: var(--background-fill-primary); border: 1px solid var(--border-color-primary); border-radius: 16px; cursor: pointer; transition: border-color .15s, background .15s; font: inherit; }
+.ddc-moment:hover { border-color: var(--button-primary-background-fill); background: var(--background-fill-secondary); }
+.ddc-moment:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
+.ddc-moment-number { font-size: 12px; color: var(--body-text-color-subdued); padding-top: 3px; font-variant-numeric: tabular-nums; }
+.ddc-moment-copy { display: grid; gap: 6px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ddc-moment-copy strong { font-size: 15px; font-weight: 600; }
+.ddc-moment-copy > span { font-size: 12px; color: var(--body-text-color-subdued); line-height: 1.5; }
+.ddc-moment-range { font-variant-numeric: tabular-nums; }
+.ddc-moment-play { display: grid; gap: 12px; justify-items: end; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ddc-moment-play > span:last-child { font-size: 20px; }
+.ddc-empty { padding: 20px; border: 1px dashed var(--border-color-primary); border-radius: 16px; color: var(--body-text-color-subdued); }
+#ddc_cmp_video { border-radius: 18px; overflow: hidden; }
+#ddc_cmp_video video { max-height: 58vh; width: 100%; object-fit: contain; }
 #ddc_pred_video video, #ddc_in_video video { max-height: 60vh; object-fit: contain; }
-#ddc_video_col { position: sticky; top: 8px; align-self: flex-start; }
-#ddc_timeline .ddc-playhead {
-  position: absolute; width: 2px; margin-left: -1px; background: #111; opacity: .75;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, .7); pointer-events: none; z-index: 5; display: none;
+#ddc_video_col { position: sticky; top: 12px; align-self: flex-start; }
+#ddc_details { margin-top: 24px; border: 1px solid var(--border-color-primary); border-radius: 16px; }
+#ddc_details > button { padding: 20px; font-size: 15px; }
+#ddc_details > button:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
+#ddc_timeline .ddc-playhead { position: absolute; width: 2px; margin-left: -1px; background: #8895c5; opacity: .85; pointer-events: none; z-index: 5; display: none; }
+@media (max-width: 700px) {
+  .gradio-container { padding: 20px 16px 40px !important; }
+  #ddc_header { padding: 20px; }
+  .ddc-overview { grid-template-columns: 1fr; }
+  .ddc-overall { padding: 22px; }
+  #ddc_video_col { position: static; }
+  #ddc_practice_row { gap: 16px; }
 }
 """
 
@@ -728,6 +1044,15 @@ _SYNC_JS = """
     input.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
     input.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
   }
+
+  document.addEventListener('click', (event) => {
+    const card = event.target.closest?.('button[data-ddc-time]');
+    if (!card || !card.closest('#ddc_practice_preview')) return;
+    const t = Number(card.dataset.ddcTime);
+    if (!Number.isFinite(t) || t < 0) return;
+    window.ddcSeek(t);
+    setSlider(t);
+  });
 
   function drawPlayhead() {
     const gd = plot(), v = video();
@@ -793,4 +1118,4 @@ _SYNC_JS = """
 if __name__ == "__main__":
     RUNS_DIR.mkdir(exist_ok=True)
     demo.launch(server_name="127.0.0.1", server_port=int(os.environ.get("PORT", 7860)), share=False, show_error=True,
-                head=_SYNC_JS, css=_CSS, allowed_paths=[str(RUNS_DIR)])
+                head=_SYNC_JS, css=_CSS, theme=_THEME, allowed_paths=[str(RUNS_DIR)])

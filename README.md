@@ -338,3 +338,108 @@ the clip (frames 667-786) -- consistent with the dancers leaving frame
 before the clip ends, not a detection dropout. In every frame where a person
 *was* detected, hands came through essentially every time (99.9%), a sharp
 contrast with MediaPipe's 15.3% hand coverage on comparable footage above.
+
+### Coaching dashboard (step 3)
+
+After **Compare dancers**, Results shows an overall movement-similarity score,
+per-dancer scores and comparable-frame coverage, the closest body region, and the
+joint/region to review. **Personalized feedback** lists up to three separated
+moments per dancer; click a row to seek the overlay. **Inspect time** gives joint
+feedback at any frame. The existing deviation timeline, worst moments and overlay
+remain available. The CSV retains its original columns (including `score`, the
+raw deviation) and appends `movement_similarity`, a per-frame heuristic score;
+blank similarity cells mean there was insufficient comparable data.
+
+**Formula:** for each eligible frame, average the existing joint distances in
+normalized torso lengths over comparable joints. Average those frame deviations
+for each dancer, then use `100 / (1 + mean_deviation)`. For example, deviations
+of 0, 0.25 and 1 torso length map to 100, 80 and 50. The overall score is the
+unweighted average of available dancer scores, excluding a reference dancer.
+It is not the average of per-frame scores because the mapping is nonlinear.
+
+A frame needs at least 6 of 17 reliable, comparable body joints. Low-confidence,
+nonfinite or missing joints are excluded. A composite joint needs a visible
+peer at the same joint in that frame, so a dancer never earns a perfect score
+by matching only themselves. A reference dancer is not scored and their
+unobserved joints are excluded even if smoothing filled a gap. Solo references
+use the existing interpolated/smoothed poses within their time overlap.
+No eligible data yields **N/A**, not zero or 100. Coverage is eligible frames
+out of all clip frames; low coverage may make scores misleadingly high.
+
+Suggestions use the same eligible joints. A joint difference below 0.15 torso
+lengths is described as close. Larger differences receive a review suggestion;
+"higher/lower" is used only for a vertical difference of at least 0.15 torso
+lengths that is at least 1.5 times its horizontal difference. Positive image y
+means lower. This describes height relative to the hips in the normalized 2D
+camera view, not depth or absolute screen position. Torso-rotation normalization
+disables directional wording. Horizontal/ambiguous differences receive neutral
+wording. Left/right joint names are the detector's anatomical labels. The 6-joint
+minimum and 0.15 tolerance are design heuristics defined in `ddc/coaching.py`.
+
+**Limitations:** this is a movement-similarity heuristic, not a scientifically
+validated accuracy percentage. Reference choice, smoothing, occlusion, camera
+perspective, tracking errors and video timing affect the result. Two dancers
+compared with their shared composite get symmetric differences; the system
+cannot tell which dancer is correct. The closest region is a relative strength,
+not proof of good technique. Scores do not evaluate rhythm, artistry or 3D form.
+No additional detector or language-model API calls are needed for coaching.
+
+Run regression tests with `python -m pytest tests -q` in your virtualenv.
+
+#### Key choreography moments to practice
+
+Results also ranks up to five **sustained pairwise pose mismatches**. Each row
+names the dancers, the peak timestamp to click, the time range to review, the
+body region and joint differing most at the peak, the mean joint distance in
+torso lengths, and the number of shared reliable joints. This helps the group
+choose specific sections of choreography to practice. It complements the
+per-dancer personalized feedback and existing Worst moments table.
+
+The detector compares normalized poses directly between each pair of selected
+dancers, independently of the composite/solo reference. Reference dancers can
+participate in these comparisons without receiving a score. A frame requires
+at least six jointly visible, confident joints and at least one distance of
+0.15 torso lengths. A candidate must persist for at least 0.25 seconds; missing
+comparisons and timestamp gaps larger than `max(0.25 seconds, 2 × median frame
+interval)` break a candidate. Candidates are ranked by their peak mean distance
+across shared joints, and reported peaks are at least one second apart. These
+thresholds are review heuristics, not scientifically validated tolerances.
+
+These events identify simultaneous **pose disagreement**, which may be useful
+when reviewing synchronization. They do **not** prove a timing lag or identify
+who is early/late: that would require temporal alignment analysis. Intentional
+choreography differences, perspective and detector errors can also cause pose
+disagreement. An empty table means no qualifying event was found with sufficient
+data; it does not certify perfect synchronization. With only one selected dancer,
+use the existing feedback against the solo reference instead of pairwise events.
+
+#### A quieter Results view
+
+Results opens with movement-similarity scores, comparable-frame coverage, the
+video overlay, and every detected priority practice moment (up to five), presented
+as replay cards with the dancers, joint, peak timestamp, and practice range. Click a suggested
+moment to seek the video, or move **Inspect time**. **View detailed feedback**
+expands the timeline, strengths and improvement areas, all priority moments,
+worst moments, timestamped joint suggestions, the scoring explanation, and CSV
+export. The detail panel closes whenever you compare again or open another run,
+so each session starts with the short overview. No analysis data is discarded.
+
+The interface uses local system fonts, ivory and graphite colors, muted indigo
+accents, and a responsive layout with light and dark color modes. Scores,
+comparison rules, and pose analysis are unchanged.
+
+#### Individual dancer reports
+
+Open **Results → View detailed feedback → Feedback report for** and select a
+dancer. Their report shows movement similarity, pose coverage, closest region,
+and area to review. The summary, worst moments, personalized suggestions, and
+current-frame feedback show only that dancer; priority moments include only pairs
+involving them. Reference dancers are explicitly not scored. Choose **All dancers**
+to restore the group tables. Video, group timeline, top-level score overview, and
+CSV export retain the full group context. The selector resets for every comparison
+or new run. Missing scores and limited pose coverage are shown explicitly.
+
+With a dancer selected, **Download report** saves their report as a standalone
+HTML page (score, coverage, personalized feedback, practice moments involving
+them, worst moments, and how scores work) to `runs/<run>/reports/`. It opens in
+any browser and prints cleanly, so it can be shared with the dancer directly.
