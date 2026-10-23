@@ -232,3 +232,16 @@ def test_key_moments_reject_invalid_timestamps(t):
     from ddc.coaching import key_moments
     with pytest.raises(ValueError, match='timestamps'):
         key_moments(poses(frames=3), t)
+
+
+def test_key_moment_joint_lies_in_reported_region():
+    from ddc.coaching import key_moments
+    from ddc.skeleton import GROUPS
+    p = poses(frames=10)
+    # One far-off elbow, but the legs differ more on average: report legs and a leg joint.
+    p[:, 1, J['right_elbow'], 0] = 1.
+    for name in ('left_knee', 'right_knee', 'left_ankle', 'right_ankle'):
+        p[:, 1, J[name], 0] = .5
+    (moment,) = key_moments(p, np.arange(10) / 10)
+    assert moment.region == 'legs'
+    assert J[moment.joint] in GROUPS['legs']

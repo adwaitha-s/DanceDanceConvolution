@@ -438,3 +438,8 @@ involving them. Reference dancers are explicitly not scored. Choose **All dancer
 to restore the group tables. Video, group timeline, top-level score overview, and
 CSV export retain the full group context. The selector resets for every comparison
 or new run. Missing scores and limited pose coverage are shown explicitly.
+
+With a dancer selected, **Download report** saves their report as a standalone
+HTML page (score, coverage, personalized feedback, practice moments involving
+them, worst moments, and how scores work) to `runs/<run>/reports/`. It opens in
+any browser and prints cleanly, so it can be shared with the dancer directly.

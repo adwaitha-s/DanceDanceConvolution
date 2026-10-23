@@ -57,6 +57,7 @@ def test_timeline_height_grows_with_dancers_and_stays_bounded():
 
 
 def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
+    from pathlib import Path
     import pandas as pd
     import app
     from ddc.analyze import analyze_run
@@ -73,7 +74,7 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(app, 'analyze_run', lambda *a, **kw: result)
     outputs = app.run_compare(run.name, ['Person 2', 'Person 4'], 'Auto (on for 3+ dancers)',
                               False, 5, app.REF_DANCER, 'Person 2', None, 0)
-    assert len(outputs) == 18
+    assert len(outputs) == 19
     rows, feedback = outputs[4], outputs[11]
     assert len(rows) == 1 and rows[0][0] == 'Dancer 2 (Person 4)'
     assert rows[0][1] < 100 and '40/40' in rows[0][2]
@@ -92,10 +93,18 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     assert own[0] == rows and own[2] == feedback
     assert 'Dancer 1 (Person 2): reference' not in own[4]
     assert 'Area to review' in own[5] and '40/40' in own[5]
+    assert own[6]['visible'] is True
+    report = Path(own[6]['value'])
+    assert report.parent == run / 'reports' and report.suffix == '.html'
+    text = report.read_text()
+    assert rows[0][0] in text and '40/40 comparable frames' in text
+    assert feedback[0][2] in text and 'Practice moments' in text
     ref = app.filter_dancer_report('Dancer 1 (Person 2)', 0)
     assert ref[0] == [] and ref[1] == [] and ref[2] == []
     assert ref[3] == key_rows
     assert 'not scored' in ref[4] and 'not scored' in ref[5]
+    assert 'Reference dancer · not scored' in Path(ref[6]['value']).read_text()
+    assert app.filter_dancer_report('All dancers', 0)[6]['visible'] is False
     assert rows[0][0] not in ref[4]
     assert outputs[16]['choices'] == ['All dancers', 'Dancer 1 (Person 2)', rows[0][0]]
     event = type('Event', (), {'index': (0, 0)})()
@@ -103,10 +112,12 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     assert len(app.begin_review(None)) == len(app.review_reset_outputs)
     assert len(app.begin_review(run.name)) == len(app.review_reset_outputs)
     reset = app.begin_review(run.name)
-    assert reset[-7:-5] == ([], [])
-    assert reset[-5] == '' and reset[-4] == ''
-    assert reset[-3]['open'] is False
-    assert outputs[-3]['open'] is False
+    assert reset[-8:-6] == ([], [])
+    assert reset[-6] == '' and reset[-5] == ''
+    assert reset[-4]['open'] is False
+    assert reset[-1] == {'value': None, 'visible': False, '__type__': 'update'}
+    assert outputs[-4]['open'] is False
+    assert outputs[-1]['visible'] is False
     assert 'Movement similarity' in outputs[13]
     assert 'Review left wrist' in outputs[14]
     assert len(outputs[12]) == len(key_rows)  # detailed rows remain available
@@ -217,3 +228,49 @@ def test_individual_report_missing_score_reference_and_escaping(monkeypatch):
     assert 'N/A' in html and '0/20' in html and 'Limited pose coverage' in html
     assert 'Dancer &lt;2&gt;' in html and '<script>' not in html
     assert 'Choose a dancer' in app.dancer_report('All dancers')
+
+
+def test_dancer_report_file_escapes_content_and_skips_group(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import app
+    run = tmp_path / '20261001-120000'
+    run.mkdir()
+    monkeypatch.setattr(app, '_LAST', {
+        'names': ['Dancer <1>'],
+        'res': SimpleNamespace(run_dir=run, coaching=SimpleNamespace(dancers=[
+            {'reference': False, 'score': 72.5, 'valid_frames': 5, 'total_frames': 20,
+             'coverage': .25, 'strength': '<b>torso</b>', 'improvement': 'wrist'}])),
+        'report_rows': ([['Dancer <1>', 72.5]], [['Dancer <1>', 1.0, 'left_wrist', .4]],
+                        [['Dancer <1>', 1.0, 'Raise <your> wrist']],
+                        [['Dancer <1> & Dancer 2', 1., .5, 1.5, 'arms', 'left wrist', .3, 17]]),
+        'report_pairs': [('Dancer <1>', 'Dancer 2')],
+    })
+    path = app.dancer_report_file('Dancer <1>')
+    html = open(path, encoding='utf-8').read()
+    assert path.endswith('dancer--1.html')
+    assert '72.5 / 100' in html and 'Limited pose coverage' in html
+    assert '<b>' not in html and 'Raise &lt;your&gt; wrist' in html
+    assert '0.50–1.50' in html
+    assert app.dancer_report_file('All dancers') is None
+    assert app.dancer_report_file('Someone else') is None
+
+
+def test_practice_moment_errors_leave_results_usable(tmp_path, monkeypatch):
+    import app
+    from ddc.analyze import analyze_run
+    from test_ddc import _write_jsonl_run, base_pose, place
+
+    run = _write_jsonl_run(tmp_path, [[place(base_pose(), 200, 300, 40),
+                                     place(base_pose(), 500, 300, 40)] for _ in range(20)])
+    result = analyze_run(run, render=False)
+    monkeypatch.setattr(app, 'RUNS_DIR', tmp_path)
+    monkeypatch.setattr(app, '_LAST', {'track_run': run.name, 'track_labels': ['Person 1', 'Person 2'],
+                                     'track_ids': {'Person 1': 0, 'Person 2': 1}})
+    monkeypatch.setattr(app, 'analyze_run', lambda *a, **kw: result)
+    def broken(*a, **kw):
+        raise ValueError('key-moment timestamps must be finite')
+    monkeypatch.setattr(app, 'key_moments', broken)
+    outputs = app.run_compare(run.name, ['Person 1', 'Person 2'], 'Auto (on for 3+ dancers)',
+                              False, 5, app.REF_COMPOSITE, None, None, 0)
+    assert outputs[12] == []
+    assert 'Practice moments unavailable' in outputs[6]

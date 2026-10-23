@@ -188,17 +188,20 @@ def key_moments(norm, t, top_n=5, min_duration_s=0.25, min_sep_s=1.0):
                 end = f - 1
                 if t[end] - t[start] >= min_duration_s:
                     peak = start + int(np.argmax(mean[start:end + 1]))
-                    j = int(np.nanargmax(distance[peak]))
                     regions = {}
                     for name, indices in GROUPS.items():
                         values = distance[peak, indices]
                         valid = values[np.isfinite(values)]
                         if valid.size:
                             regions[name] = float(valid.mean())
+                    region = max(regions, key=regions.get)
+                    # The joint to review lies in the reported region, so a row
+                    # never pairs "legs" with an arm joint.
+                    indices = GROUPS[region]
+                    j = indices[int(np.nanargmax(distance[peak, indices]))]
                     candidates.append(KeyMoment(
                         (a, b), float(t[start]), float(t[end]), float(t[peak]),
-                        float(mean[peak]), int(counts[peak]),
-                        max(regions, key=regions.get), BODY[j]))
+                        float(mean[peak]), int(counts[peak]), region, BODY[j]))
                 start = None
             if f < len(t) and mismatch[f] and start is None:
                 start = f
