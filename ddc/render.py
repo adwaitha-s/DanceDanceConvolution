@@ -94,7 +94,7 @@ def render_overlay(dense, dev, origin, scale, rot, t, out_path, video_path=None,
                                     cv2.FONT_HERSHEY_SIMPLEX, max(0.5, h / 1400), (255, 255, 255),
                                     2, cv2.LINE_AA)
                     continue
-                ref = dev.composite[f, d] if dev.leave_one_out else dev.composite[f]
+                ref = dev.ref_pose(f, d)
                 ghost = denormalize(ref, origin[f, d], scale[f, d], rot[f, d])
                 # composite ghost (behind)
                 for a, b in EDGE_IDX:

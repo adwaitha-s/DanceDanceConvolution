@@ -218,7 +218,7 @@ def _ensure_solo_run(run_dir: Path, solo_video) -> Path:
 def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
                 smooth=5, render=True, selected_tracks=None, on_progress=None,
                 reference_mode="composite", reference_dancer=None, solo_video=None,
-                solo_offset=0.0, merge_groups=None) -> Result:
+                solo_offset=0.0, merge_groups=None, time_tolerance=0.0) -> Result:
     """`selected_tracks`: track ids (from `detect_tracks`) to keep as dancers; a
     bystander/audience member's track dropped here never reaches the composite
     or any deviation score. None keeps every stabilized track (old behavior).
@@ -230,7 +230,10 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
     with t=0 of this run).
 
     `merge_groups`: groups of track ids (as numbered by `detect_tracks`) to merge
-    into one dancer before `selected_tracks` is applied."""
+    into one dancer before `selected_tracks` is applied.
+
+    `time_tolerance`: seconds a dancer may be early/late relative to the reference
+    before it counts against them (0 = compare simultaneous frames only)."""
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"unknown reference_mode {reference_mode!r}")
     run_dir = Path(run_dir)
@@ -270,7 +273,8 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
             raise ValueError("the solo reference video doesn't overlap this video's timeline "
                              "-- check the offset")
     dev = compute_deviation(norm, leave_one_out=leave_one_out, smooth=smooth,
-                            reference=reference, reference_track=ref_track)
+                            reference=reference, reference_track=ref_track,
+                            tolerance=int(round(max(0.0, time_tolerance) * _fps(det.t))))
 
     moments = worst_moments(dev, det.t)
     summary = []
@@ -334,6 +338,9 @@ def main():
     ap.add_argument("--solo-video", help="with --reference solo: the solo reference video")
     ap.add_argument("--solo-offset", type=float, default=0.0,
                     help="seconds into the solo video that line up with t=0 of this run")
+    ap.add_argument("--time-tolerance", type=float, default=0.0,
+                    help="seconds a dancer may lead/lag the reference without penalty "
+                         "(default 0: compare simultaneous frames only)")
     a = ap.parse_args()
     merges = [[int(x) for x in m.split(",")] for m in a.merge] if a.merge else None
     if a.list_tracks:
@@ -344,9 +351,10 @@ def main():
     r = analyze_run(a.run_dir, a.video, a.loo, a.rotate, render=not a.no_render,
                     selected_tracks=selected, reference_mode=a.reference,
                     reference_dancer=a.reference_dancer, solo_video=a.solo_video,
-                    solo_offset=a.solo_offset, merge_groups=merges)
+                    solo_offset=a.solo_offset, merge_groups=merges,
+                    time_tolerance=a.time_tolerance)
     print(f"{r.n_tracks} dancers, {len(r.t)} frames, reference={r.dev.mode}, "
-          f"leave_one_out={r.dev.leave_one_out}")
+          f"leave_one_out={r.dev.leave_one_out}, tolerance={r.dev.tolerance} frames")
     for s in r.summary:
         print(s)
     print("csv:", r.csv_path, "\noverlay:", r.overlay_path)
