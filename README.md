@@ -111,6 +111,17 @@ under "Compare each dancer against":
 CLI equivalents: `python -m ddc.analyze runs/<ts> --reference dancer --reference-dancer 0`
 or `--reference solo --solo-video solo.mp4 --solo-offset 0.5`.
 
+### Timing tolerance (step 2)
+
+By default each dancer frame is compared with the reference at the same instant,
+so being a little early or late counts as a pose difference. "Timing tolerance (s)"
+under Advanced settings (0–1 s, default 0) relaxes this: each dancer frame is scored
+against whichever reference frame within ±tolerance it matches best, so the score
+reflects shape rather than small timing slips. The overlay's reference ghost and the
+per-joint feedback use that matched pose. 0 is strictest; around 0.1–0.25 s forgives
+typical slips, while larger values can hide real mistakes in fast choreography.
+Applies to every reference mode. CLI: `--time-tolerance 0.25`.
+
 ## Run the YOLO demo (body only, fast, live webcam)
 
 ```bash

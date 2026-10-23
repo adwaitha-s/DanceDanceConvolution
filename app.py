@@ -440,7 +440,8 @@ def practice_preview(key_rows):
 
 @_friendly("Comparison")
 def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
-                ref_choice, ref_dancer, solo_video, solo_offset, progress=gr.Progress()):
+                ref_choice, ref_dancer, solo_video, solo_offset, time_tolerance=0.0,
+                progress=gr.Progress()):
     _require_people(run_name)
     if not track_choice:
         raise gr.Error("Select at least one person as a dancer.")
@@ -462,6 +463,7 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
                           reference_mode=mode, reference_dancer=ref_idx,
                           solo_video=solo_video, solo_offset=float(solo_offset or 0),
                           merge_groups=_LAST.get("merges") or None,
+                          time_tolerance=float(time_tolerance or 0),
                           on_progress=_frame_progress(progress, 0.15, 0.95,
                                                       "Rendering deviation overlay"))
     except ValueError as e:
@@ -792,6 +794,11 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     1, 15, step=2, value=5, label="Composite smoothing (frames)",
                     info="Averages the reference pose over this many frames. Higher is "
                          "steadier but blurs fast moves.")
+                time_tolerance = gr.Slider(
+                    0, 1, step=0.05, value=0, label="Timing tolerance (s)",
+                    info="How far ahead of or behind the reference a dancer may be before it "
+                         "counts as a difference. 0 is strictest (same instant only); raise it "
+                         "to forgive small timing slips and score shape alone.")
             cmp_btn = gr.Button("Compare dancers", variant="primary", interactive=False)
             cmp_progress = gr.Markdown(min_height=40)   # where the Compare progress bar shows
 
@@ -903,7 +910,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                              outputs=predicted_overlay, show_progress_on=predicted_overlay)
     cmp_btn.click(run_compare,
                   inputs=[active_run, track_select, loo_choice, rotate, smooth,
-                          ref_choice, ref_dancer, solo_video, solo_offset],
+                          ref_choice, ref_dancer, solo_video, solo_offset, time_tolerance],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
                            cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl,
                            key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download],

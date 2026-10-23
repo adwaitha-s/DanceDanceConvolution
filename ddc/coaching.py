@@ -108,7 +108,7 @@ def joint_feedback(dev, norm, coaching, frame, dancer, joint, t, rotate=False):
     stamp = f"at {t:.2f} seconds"
     if distance < NOTICE_DISTANCE:
         return f"Your {name} is close to the reference {stamp}."
-    ref = dev.composite[frame, dancer, joint] if dev.leave_one_out else dev.composite[frame, joint]
+    ref = dev.ref_pose(frame, dancer)[joint]
     delta = norm[frame, dancer, joint, :2] - ref
     if not rotate and np.isfinite(delta).all() and abs(delta[1]) >= NOTICE_DISTANCE and abs(delta[1]) >= 1.5 * abs(delta[0]):
         direction = "lower" if delta[1] > 0 else "higher"
