@@ -427,3 +427,14 @@ so each session starts with the short overview. No analysis data is discarded.
 The interface uses local system fonts, ivory and graphite colors, muted indigo
 accents, and a responsive layout with light and dark color modes. Scores,
 comparison rules, and pose analysis are unchanged.
+
+#### Individual dancer reports
+
+Open **Results → View detailed feedback → Feedback report for** and select a
+dancer. Their report shows movement similarity, pose coverage, closest region,
+and area to review. The summary, worst moments, personalized suggestions, and
+current-frame feedback show only that dancer; priority moments include only pairs
+involving them. Reference dancers are explicitly not scored. Choose **All dancers**
+to restore the group tables. Video, group timeline, top-level score overview, and
+CSV export retain the full group context. The selector resets for every comparison
+or new run. Missing scores and limited pose coverage are shown explicitly.

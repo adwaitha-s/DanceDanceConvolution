@@ -286,7 +286,7 @@ N_PEOPLE_OUTPUTS = 10   # length of the tuple _show_people returns
 def begin_review(run_name):
     """Jump to step 2 for `run_name` and blank everything left over from another run."""
     if not run_name:
-        return [gr.skip()] * 25
+        return [gr.skip()] * 27
     return (gr.Tabs(selected=TAB_DANCERS),
             f"### {_run_label(RUNS_DIR / run_name)}",
             # step 2
@@ -294,7 +294,8 @@ def begin_review(run_name):
             gr.update(choices=[], value=[]), None, gr.update(value=None, visible=False), "",
             "Finding people...", "", gr.update(interactive=False),
             # step 3
-            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", "", gr.update(open=False))
+            NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", "", gr.update(open=False),
+            gr.update(choices=["All dancers"], value="All dancers"), "")
 
 
 @_friendly("Finding people")
@@ -524,16 +525,54 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
     note = f"**Overall movement similarity: {overall_label}** (heuristic).\n\n" + note
     feedback = [[names[d], tm, message] for d, tm, message in
                 feedback_moments(res.dev, res.norm, res.coaching, res.t, res.rotate)]
+    priority = key_moments(res.norm, res.t)
     key_rows = [[f"{names[m.dancers[0]]} & {names[m.dancers[1]]}", m.peak,
                  m.start, m.end, m.region, m.joint.replace("_", " "),
                  round(m.mean_deviation, 3), m.comparable_joints]
-                for m in key_moments(res.norm, res.t)]
+                for m in priority]
+    _LAST["report_rows"] = (rows, moments, feedback, key_rows)
+    _LAST["report_pairs"] = [tuple(names[d] for d in m.dancers) for m in priority]
     max_t = float(res.t[-1])
     return (gr.Tabs(selected=TAB_RESULTS), f"### {_run_label(RUNS_DIR / run_name)}",
             res.overlay_path, timeline_figure(res.dev, res.t), rows, moments,
             note + validation_note, res.csv_path, gr.update(maximum=max_t, value=0),
             frame_detail(0), _review_status(track_choice), feedback, key_rows,
-            results_overview(res, names, key_rows), practice_preview(key_rows), gr.update(open=False))
+            results_overview(res, names, key_rows), practice_preview(key_rows), gr.update(open=False),
+            gr.update(choices=["All dancers"] + names, value="All dancers"),
+            dancer_report("All dancers"))
+
+
+def dancer_report(dancer):
+    """Readable individual report without implying that reference dancers are scored."""
+    names = _LAST.get("names", [])
+    if dancer == "All dancers":
+        return '<p class="ddc-empty">Choose a dancer above to open their individual report.</p>'
+    if dancer not in names or _LAST.get("res") is None:
+        return '<p class="ddc-empty">Compare dancers to load an individual report.</p>'
+    c = _LAST["res"].coaching.dancers[names.index(dancer)]
+    if c["reference"]:
+        body = '<p>Reference dancer · not scored. Pairwise practice moments involving this dancer are listed below.</p>'
+    else:
+        score = f'{c["score"]:.1f} / 100' if c["score"] is not None else 'N/A · insufficient comparable pose data'
+        body = (f'<p class="ddc-dancer-score">{score}</p>'
+                f'<p>{c["valid_frames"]}/{c["total_frames"]} comparable frames ({c["coverage"]:.0%})</p>'
+                f'<p><strong>Strength / closest region:</strong> {escape(c["strength"])}</p>'
+                f'<p><strong>Area to review:</strong> {escape(c["improvement"])}</p>'
+                '<p class="ddc-muted">Movement similarity is a heuristic, not a validated accuracy percentage.</p>')
+        if c["coverage"] < .5:
+            body += '<p>Limited pose coverage; interpret this score cautiously.</p>'
+    return f'<section class="ddc-dancer" aria-label="Individual dancer report"><h3>{escape(dancer)}</h3>{body}</section>'
+
+
+def filter_dancer_report(dancer, t_sec):
+    """Filter by exact dancer identity, keeping the cached full analysis intact."""
+    rows, moments, feedback, priority = _LAST.get("report_rows", ([], [], [], []))
+    if dancer != "All dancers":
+        rows, moments, feedback = ([r for r in table if r[0] == dancer]
+                                  for table in (rows, moments, feedback))
+        priority = [r for r, pair in zip(priority, _LAST.get("report_pairs", []))
+                    if dancer in pair]
+    return rows, moments, feedback, priority, frame_detail(t_sec, dancer), dancer_report(dancer)
 
 
 def jump_to_moment(rows, evt: gr.SelectData):
@@ -541,15 +580,18 @@ def jump_to_moment(rows, evt: gr.SelectData):
     return float(rows.iloc[evt.index[0], 1])
 
 
-def frame_detail(t_sec):
+def frame_detail(t_sec, dancer="All dancers"):
     res = _LAST.get("res")
     if res is None:
         return "Run an analysis first."
     f = int(np.argmin(np.abs(res.t - t_sec)))
     lines = [f"t={res.t[f]:.2f}s (frame {f}), {int(res.dev.n_present[f])} dancer(s) present"]
+    names = _LAST.get("names", [f"Dancer {i + 1}" for i in range(res.n_tracks)])
     for d in range(res.n_tracks):
+        if dancer != "All dancers" and names[d] != dancer:
+            continue
         if d == res.dev.reference_track:
-            lines.append(f"Dancer {d + 1}: reference")
+            lines.append(f"{names[d]}: reference (not scored)")
             continue
         name = _LAST.get("names", [f"Dancer {i + 1}" for i in range(res.n_tracks)])[d]
         j = res.coaching.joint[f, d]
@@ -569,7 +611,7 @@ def frame_detail(t_sec):
 
 # Runs in the browser before `frame_detail`: any change of the time slider (dragging it,
 # clicking a worst-moment row) also moves the video. `ddcSeek` is defined in _SYNC_JS.
-_SEEK_ON_SLIDER_JS = "(t) => { if (window.ddcSeek) window.ddcSeek(t); return t; }"
+_SEEK_ON_SLIDER_JS = "(t, dancer) => { if (window.ddcSeek) window.ddcSeek(t); return [t, dancer]; }"
 # Each step starts at the top of the page, not wherever the previous step was scrolled to.
 _SCROLL_TOP_JS = "() => { window.scrollTo({top: 0, behavior: 'smooth'}); }"
 _SCROLL_TOP_JS_KEEP = "(run) => { window.scrollTo({top: 0, behavior: 'smooth'}); return run; }"
@@ -686,14 +728,17 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
             with gr.Accordion("View detailed feedback", open=False, elem_id="ddc_details") as details_panel:
                 gr.Markdown("### A closer look\n"
                             "Explore each dancer, compare moments, or download the full analysis.")
+                report_dancer = gr.Dropdown(["All dancers"], value="All dancers",
+                                            label="Feedback report for", interactive=True)
+                individual_report = gr.HTML()
                 cmp_note = gr.Markdown()
                 summary_tbl = gr.Dataframe(
                     headers=["Dancer", "Similarity / 100", "Comparable frames", "Mean raw deviation",
                              "Strength / closest region", "Area to review"],
                     interactive=False, wrap=True, label="Per-dancer coaching summary (heuristic scores)")
-                timeline = gr.Plot(label="Timeline — click to inspect a moment", elem_id="ddc_timeline")
+                timeline = gr.Plot(label="Group timeline (all dancers) — click to inspect a moment", elem_id="ddc_timeline")
                 detail = gr.Textbox(label="At this moment", lines=6)
-                gr.Markdown("### All priority practice moments\n"
+                gr.Markdown("### Priority practice moments for the selected dancer\n"
                             "Up to five sustained pairwise pose differences, ranked by peak mean "
                             "deviation. The review range gives you the surrounding section to practice. "
                             "These do not establish who is early or late.")
@@ -715,12 +760,12 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                                 "seconds. Reference dancers can be compared without receiving a score. "
                                 "An empty list means no qualifying event was found with enough data; "
                                 "it does not certify synchronization.")
-                csv_out = gr.File(label="Download per-frame analysis · CSV")
+                csv_out = gr.File(label="Download full group per-frame analysis · CSV")
 
     people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
                       predicted_overlay, predictor_note, people_headline, review_status, cmp_btn]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
-                      csv_out, detail, feedback_tbl, key_moments_tbl, overview, practice_tbl, details_panel]
+                      csv_out, detail, feedback_tbl, key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
 
     demo.load(_runs_update, outputs=run_dd)
@@ -769,17 +814,20 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                           ref_choice, ref_dancer, solo_video, solo_offset],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
                            cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl,
-                           key_moments_tbl, overview, practice_tbl, details_panel],
+                           key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report],
                   show_progress_on=cmp_progress
                   ).success(lambda: None, js=_SCROLL_TOP_JS)
-    t_slider.change(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    report_dancer.change(filter_dancer_report, inputs=[report_dancer, t_slider],
+                         outputs=[summary_tbl, moments_tbl, feedback_tbl, key_moments_tbl,
+                                  detail, individual_report])
+    t_slider.change(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
     moments_tbl.select(jump_to_moment, inputs=moments_tbl, outputs=t_slider
-    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
     feedback_tbl.select(jump_to_moment, inputs=feedback_tbl, outputs=t_slider
-    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
     key_moments_tbl.select(jump_to_moment, inputs=key_moments_tbl, outputs=t_slider
-    ).then(frame_detail, inputs=t_slider, outputs=detail, js=_SEEK_ON_SLIDER_JS)
+    ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
 
 
 
