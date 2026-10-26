@@ -41,35 +41,33 @@ def _limb_angles(p: np.ndarray) -> np.ndarray:
     return np.stack(out, axis=-1)
 
 
-def _shift(ref: np.ndarray, s: int) -> np.ndarray:
-    """out[f] = ref[f + s], NaN where that falls outside the clip."""
-    out = np.full_like(ref, np.nan)
-    F = len(ref)
-    if s >= 0:
-        out[:F - s] = ref[s:]
-    else:
-        out[-s:] = ref[:F + s]
-    return out
-
-
 def _match_in_window(xy: np.ndarray, ok: np.ndarray, ref: np.ndarray, tolerance: int):
     """For each (frame, dancer) pick the reference frame within +-`tolerance` frames with
     the smallest mean joint distance. Ties go to the smaller offset, so 0 wins when equal.
-    Returns (matched (F,T,17,2), lag (F,T))."""
+    Returns (matched (F,T,17,2), lag (F,T)).
+
+    Only the best score and offset are kept per shift; the matched poses are gathered
+    once at the end, so memory doesn't grow with the tolerance."""
     F, T = xy.shape[:2]
     best = np.full((F, T), np.inf)
-    matched = np.full_like(ref, np.nan)
     lag = np.zeros((F, T), int)
     for s in sorted(range(-tolerance, tolerance + 1), key=lambda s: (abs(s), s)):
-        cand = _shift(ref, s)
-        dist = np.linalg.norm(xy - cand, axis=-1)
-        dist[~ok] = np.nan
-        with np.errstate(all="ignore"):
-            score = np.nanmean(dist, axis=-1)
-        better = np.isfinite(score) & (score < best)
-        best[better] = score[better]
-        matched[better] = cand[better]
-        lag[better] = s
+        lo, hi = max(0, -s), min(F, F - s)     # frames f whose f + s is inside the clip
+        if hi <= lo:
+            continue
+        dist = np.linalg.norm(xy[lo:hi] - ref[lo + s:hi + s], axis=-1)
+        use = ok[lo:hi] & np.isfinite(dist)
+        n = use.sum(-1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            score = np.where(use, dist, 0.0).sum(-1) / n
+        b, g = best[lo:hi], lag[lo:hi]
+        better = (n > 0) & (score < b)
+        b[better] = score[better]
+        g[better] = s
+    found = np.isfinite(best)
+    fi = np.clip(np.arange(F)[:, None] + lag, 0, F - 1)
+    matched = ref[fi, np.arange(T)[None, :]]
+    matched[~found] = np.nan
     return matched, lag
 
 

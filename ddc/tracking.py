@@ -6,10 +6,15 @@ detections across frames with Hungarian matching.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import warnings
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .skeleton import CONF_THR, J
+from .smoothing import nan_moving_mean
 
 
 def _size(p: np.ndarray) -> float:
@@ -34,6 +39,33 @@ def _cost(a: np.ndarray, b: np.ndarray) -> float:
     return d / _size(a)
 
 
+def _sizes(poses: np.ndarray) -> np.ndarray:
+    """`_size` for each of (N,17,3) poses at once."""
+    ok = poses[..., 2] >= CONF_THR
+    torso = [J["left_shoulder"], J["right_shoulder"], J["left_hip"], J["right_hip"]]
+    sh = poses[:, [J["left_shoulder"], J["right_shoulder"]], :2].mean(1)
+    hp = poses[:, [J["left_hip"], J["right_hip"]], :2].mean(1)
+    with np.errstate(invalid="ignore"):
+        torso_len = np.linalg.norm(sh - hp, axis=1)
+    pts = np.where(ok[..., None], poses[..., :2], np.nan)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        extent = np.linalg.norm(np.nanmax(pts, 1) - np.nanmin(pts, 1), axis=1) * 0.4
+    out = np.where(ok.sum(1) >= 2, np.maximum(np.nan_to_num(extent, nan=1.0), 1.0), 1.0)
+    return np.where(ok[:, torso].all(1), np.maximum(np.nan_to_num(torso_len, nan=1.0), 1.0), out)
+
+
+def _cost_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """C[i, j] = `_cost(a[i], b[j])` for (A,17,3) and (B,17,3) poses."""
+    both = (a[:, None, :, 2] >= CONF_THR) & (b[None, :, :, 2] >= CONF_THR)
+    with np.errstate(invalid="ignore"):
+        d = np.linalg.norm(a[:, None, :, :2] - b[None, :, :, :2], axis=-1)
+    n = both.sum(-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(both, d, 0.0).sum(-1) / n
+    return np.where(n >= 3, mean / _sizes(a)[:, None], np.inf)
+
+
 def _dedupe(frame: np.ndarray, dup_cost: float = 0.4) -> np.ndarray:
     """Boolean keep-mask: drop near-identical detections of the same person.
 
@@ -42,12 +74,14 @@ def _dedupe(frame: np.ndarray, dup_cost: float = 0.4) -> np.ndarray:
     """
     n = len(frame)
     keep = np.ones(n, bool)
+    if n < 2:
+        return keep
     quality = [((p[:, 2] >= CONF_THR).sum(), np.nanmean(p[:, 2])) for p in frame]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if keep[i] and keep[j] and min(_cost(frame[i], frame[j]),
-                                           _cost(frame[j], frame[i])) < dup_cost:
-                keep[j if quality[i] >= quality[j] else i] = False
+    C = _cost_matrix(frame, frame)
+    close = np.minimum(C, C.T) < dup_cost
+    for i, j in zip(*np.nonzero(np.triu(close, 1))):   # row-major, same order as a double loop
+        if keep[i] and keep[j]:
+            keep[j if quality[i] >= quality[j] else i] = False
     return keep
 
 
@@ -62,13 +96,7 @@ def _center(p: np.ndarray) -> np.ndarray:
 
 def _smoothed_centers(cs: np.ndarray, win: int = 5) -> np.ndarray:
     """Moving nanmean of (n,2) centers so one flailing frame doesn't decide a link."""
-    out = np.full_like(cs, np.nan)
-    h = win // 2
-    for i in range(len(cs)):
-        seg = cs[max(0, i - h): i + h + 1]
-        if np.isfinite(seg).any():
-            out[i] = np.nanmean(seg, axis=0)
-    return out
+    return nan_moving_mean(cs, win)
 
 
 def _make_group(occ: list, kps: list, members: list) -> dict:
@@ -141,6 +169,9 @@ def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
     heap: list = []
 
     def push(x: int, y: int):
+        fx, fy = groups[x]["frames"], groups[y]["frames"]
+        if max(fx[0], fy[0]) - min(fx[-1], fy[-1]) > max_stitch_gap:   # too far apart in time
+            return
         c = _link_cost(groups[x], groups[y], fps, max_stitch_gap)
         if c <= stitch_cost:
             heapq.heappush(heap, (c, x, y, version[x], version[y]))
@@ -165,11 +196,25 @@ def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
     return [g["members"] for g in sorted(groups.values(), key=lambda g: (g["frames"][0], g["members"][0]))]
 
 
+# Shorter tracks are dropped as spurious; in seconds so it means the same at 30 and 60 fps.
+# The matching and stitching gaps stay in frames: scaling them with fps lets a lost track
+# grab a different nearby dancer (on a 60 fps team run it swapped identities and broke
+# the saved merges), because the match/link costs don't tighten with the gap length.
+MIN_TRACK_S = 15 / 30
+
+
+def _frames(seconds: float, fps: float) -> int:
+    return max(1, int(round(seconds * fps)))
+
+
 def stabilize(kps: list, max_cost: float = 2.0, max_gap: int = 10,
-              min_track_len: int = 15, dup_cost: float = 0.4, stitch: bool = True,
+              min_track_len: int | None = None, dup_cost: float = 0.4, stitch: bool = True,
               max_stitch_gap: int = 150, stitch_cost: float = 1.0, fps: float = 30.0,
               return_info: bool = False):
     """Assign stable track ids.
+
+    `max_gap`, `min_track_len` and `max_stitch_gap` are in frames; `min_track_len=None`
+    derives it from `fps` and MIN_TRACK_S (15 frames at 30 fps).
 
     Returns (track_ids, n_tracks) where track_ids[f] is an int array aligned
     with kps[f] (-1 = dropped as a short-lived spurious track).
@@ -181,6 +226,7 @@ def stabilize(kps: list, max_cost: float = 2.0, max_gap: int = 10,
     lost. `return_info=True` adds a third value: {"raw": pre-stitch ids,
     "fragments": number of raw fragments in each final track}.
     """
+    min_track_len = _frames(MIN_TRACK_S, fps) if min_track_len is None else min_track_len
     raw, n_raw = _track_frames(kps, max_cost, max_gap, dup_cost)
 
     occs: list[list[tuple[int, int]]] = [[] for _ in range(n_raw)]
@@ -216,12 +262,8 @@ def _track_frames(kps: list, max_cost: float, max_gap: int, dup_cost: float):
         keep = _dedupe(frame, dup_cost) if len(frame) else np.zeros(0, bool)
         assigned = np.full(len(frame), -1, int)
         if keep.any() and active:
-            C = np.full((len(frame), len(active)), np.inf)
-            for i, p in enumerate(frame):
-                if not keep[i]:
-                    continue
-                for j, tid in enumerate(active):
-                    C[i, j] = _cost(tracks[tid]["pose"], p)
+            C = _cost_matrix(np.stack([tracks[tid]["pose"] for tid in active]), frame).T
+            C[~keep] = np.inf
             Cf = np.where(np.isfinite(C) & (C <= max_cost), C, 1e6)
             r, c = linear_sum_assignment(Cf)
             for i, j in zip(r, c):
@@ -280,6 +322,83 @@ def to_dense(kps: list, track_ids: list, n_tracks: int) -> np.ndarray:
     return dense
 
 
+# Bump when stabilize() output changes for the same input, to invalidate cached tracks.
+TRACKER_VERSION = 2
+_MEMO: dict = {}
+_MEMO_SIZE = 4
+
+
+def _run_fps(t: np.ndarray) -> float:
+    return float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
+
+
+def _copy_result(ids, n, info):
+    return ([a.copy() for a in ids], n,
+            {"raw": [a.copy() for a in info["raw"]], "fragments": list(info["fragments"])})
+
+
+def _tracks_cache_path(det):
+    src = getattr(det, "source", None)
+    return src.with_name(src.stem + ".tracks.npz") if src is not None else None
+
+
+def cached_stabilize(det, **params):
+    """`stabilize(det.kps, fps=<run fps>, return_info=True, **params)`, memoized.
+
+    Tracking a long run takes a while and every view of the run (Find people, merges,
+    Compare, feature inventory) needs the same answer, so the result is kept in memory
+    and in `<stem>.tracks.npz` next to the JSONL, keyed by the JSONL contents
+    (`det.key`), the parameters and TRACKER_VERSION. Returns (ids, n, info)."""
+    params.setdefault("fps", _run_fps(det.t))
+    key = getattr(det, "key", "")
+    if not key:
+        return stabilize(det.kps, return_info=True, **params)
+    defaults = {k: v.default for k, v in inspect.signature(stabilize).parameters.items()
+                if v.default is not inspect.Parameter.empty}
+    settings = sorted({**defaults, **params, "min_track_s": MIN_TRACK_S}.items())
+    digest = hashlib.sha1(f"{TRACKER_VERSION}|{key}|{settings}".encode()).hexdigest()
+    src = str(getattr(det, "source", ""))
+    hit = _MEMO.get((src, digest))
+    if hit is None:
+        hit = _read_tracks(_tracks_cache_path(det), digest)
+    if hit is None:
+        hit = stabilize(det.kps, return_info=True, **params)
+        _write_tracks(_tracks_cache_path(det), digest, *hit)
+    _MEMO[(src, digest)] = hit
+    while len(_MEMO) > _MEMO_SIZE:
+        _MEMO.pop(next(iter(_MEMO)))
+    return _copy_result(*hit)
+
+
+def _read_tracks(path, digest):
+    if path is None or not path.exists():
+        return None
+    try:
+        with np.load(path) as z:
+            if str(z["digest"]) != digest:
+                return None
+            cuts = np.cumsum(z["counts"])[:-1]
+            ids = np.split(z["ids"], cuts) if len(z["counts"]) else []
+            raw = np.split(z["raw"], cuts) if len(z["counts"]) else []
+            return ids, int(z["n"]), {"raw": raw, "fragments": z["fragments"].tolist()}
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _write_tracks(path, digest, ids, n, info):
+    if path is None:
+        return
+    tmp = path.with_name(path.name + ".tmp.npz")
+    try:
+        np.savez(tmp, digest=np.array(digest), n=n, counts=np.array([len(a) for a in ids], int),
+                 ids=np.concatenate(ids) if ids else np.zeros(0, int),
+                 raw=np.concatenate(info["raw"]) if ids else np.zeros(0, int),
+                 fragments=np.array(info["fragments"], int))
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
 def stable_track_ids(det, merge_groups=None) -> tuple[list, int]:
     """Final per-frame track ids for a loaded run: automatic stitching, then any manual merges.
 
@@ -287,9 +406,7 @@ def stable_track_ids(det, merge_groups=None) -> tuple[list, int]:
     list, the composite analysis and the dancer-filtering features must all use it, or
     labels and predictions attach to different people than the ones on screen.
     """
-    t = det.t
-    fps = float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
-    ids, n = stabilize(det.kps, fps=fps)
+    ids, n, _ = cached_stabilize(det)
     groups = [sorted(set(g)) for g in (merge_groups or []) if len(set(g)) > 1]
     if groups:
         ids, n = merge_track_ids(det.kps, ids, groups)

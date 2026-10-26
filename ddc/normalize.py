@@ -5,17 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from .skeleton import CONF_THR, J
+from .smoothing import nan_moving_mean
 
 
 def _smooth_nan(x: np.ndarray, win: int) -> np.ndarray:
     """Centered moving average along axis 0 ignoring NaNs; fills short gaps."""
-    out = np.full_like(x, np.nan)
-    h = win // 2
-    for i in range(len(x)):
-        seg = x[max(0, i - h): i + h + 1]
-        if np.isfinite(seg).any():
-            out[i] = np.nanmean(seg, axis=0)
-    return out
+    return nan_moving_mean(x, win)
 
 
 def normalize(dense: np.ndarray, smooth_win: int = 15, rotate: bool = False):

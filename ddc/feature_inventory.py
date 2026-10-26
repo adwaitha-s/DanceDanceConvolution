@@ -339,25 +339,19 @@ def collect_feature_inventory(tracking_jsonl: str | Path, merge_groups=None) -> 
     frame_height = []
     frame_x = []
     frame_y = []
+    boxes = np.concatenate(det.bbox) if det.bbox else np.zeros((0, 4))
+    owner = np.concatenate(ids) if ids else np.zeros(0, int)
+    has_box = np.isfinite(boxes).all(1)
     for tid in range(n_tracks):
-        h, x, y = [], [], []
-        for people, assigned in zip(det.raw, ids):
-            for person, candidate in zip(people, assigned):
-                if candidate == tid and person.get("bbox"):
-                    box = person["bbox"]
-                    h.append(box[3] - box[1])
-                    x.append((box[0] + box[2]) / 2)
-                    y.append((box[1] + box[3]) / 2)
-        frame_height.append(h)
-        frame_x.append(x)
-        frame_y.append(y)
+        box = boxes[(owner == tid) & has_box]
+        frame_height.append((box[:, 3] - box[:, 1]).tolist())
+        frame_x.append(((box[:, 0] + box[:, 2]) / 2).tolist())
+        frame_y.append(((box[:, 1] + box[:, 3]) / 2).tolist())
     # Detector JSON does not carry image dimensions.  The largest observed
     # bounding-box edge is a stable, data-only proxy for the frame boundary.
     # This is preferable to normalizing each track against a different scale.
-    frame_width = max((float(person["bbox"][2]) for people in det.raw for person in people
-                       if person.get("bbox")), default=1.0)
-    frame_height_px = max((float(person["bbox"][3]) for people in det.raw for person in people
-                           if person.get("bbox")), default=1.0)
+    frame_width = float(boxes[has_box, 2].max()) if has_box.any() else 1.0
+    frame_height_px = float(boxes[has_box, 3].max()) if has_box.any() else 1.0
 
     rows = []
     for tid in range(n_tracks):
@@ -592,7 +586,7 @@ def render_classifier_overlay(run_dir: str | Path, show_non_dancers: bool = True
     raw_overlay = overlay.with_suffix(".raw.mp4")
     json_out = overlay.with_suffix(".jsonl") if output else run_dir / f"{stem}.jsonl"
     writer = cv2.VideoWriter(str(raw_overlay), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
-    total = max(1, len(det.raw))
+    total = max(1, det.n_frames)
     colors = {"dancer": (45, 210, 80), "non_dancer": (70, 140, 255), "unclassified": (180, 180, 180)}
     try:
         with json_out.open("w") as output_file:
