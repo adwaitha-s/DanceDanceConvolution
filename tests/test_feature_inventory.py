@@ -1,17 +1,16 @@
-from ddc.dancer_features import write_synthetic_demo
-from ddc.feature_inventory import FEATURE_SPECS, write_inventory_artifacts
+from ddc.feature_inventory import collect_feature_inventory
+from ddc.training_features import FEATURES, PREDICTOR_IDS
+from test_data import write_synthetic_demo
 
 
-def test_feature_inventory_writes_wide_matrix_and_embedded_predictions(tmp_path):
+def test_training_inventory_measures_candidates_on_merged_tracks(tmp_path):
     tracking = tmp_path / "tracking.jsonl"
-    labels = tmp_path / "labels.csv"
-    out = tmp_path / "out"
-    write_synthetic_demo(tracking, labels, frames=50)
+    write_synthetic_demo(tracking, tmp_path / "labels.csv", frames=50)
 
-    result = write_inventory_artifacts(tracking, labels, out)
-    assert len(FEATURE_SPECS) >= 50
-    assert len(result["selected_features"]) == 3
-    assert (out / "feature_inventory.json").exists()
-    assert (out / "track_feature_inventory.csv").exists()
-    assert (out / "dancer_predictions.csv").exists()
-    assert "Embedded" in result["selection_method"]
+    rows = collect_feature_inventory(tracking, [[0, 1]])
+    assert len(rows) == 7
+    assert [row["track_id"] for row in rows] == list(range(7))
+    assert len(FEATURES) == 40
+    assert all(fid in rows[0]["values"] for fid in PREDICTOR_IDS)
+    assert not any(fid.startswith("context_") or fid.startswith("human_")
+                   for fid in PREDICTOR_IDS)

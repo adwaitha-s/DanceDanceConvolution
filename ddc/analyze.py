@@ -20,7 +20,7 @@ from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
 from .reference import reference_from_solo, reference_from_track
 from .skeleton import BODY
-from .tracking import cached_stabilize, merge_track_ids, to_dense
+from .tracking import stable_track_ids, to_dense
 
 
 @dataclass
@@ -106,21 +106,6 @@ def _fps(t: np.ndarray) -> float:
     return float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
 
 
-def _apply_merges(kps, ids, fragments, merge_groups):
-    """Manual merges on top of the automatic stitching. Returns (ids, n, fragments per track)."""
-    if not merge_groups:
-        return ids, len(fragments), fragments
-    groups = [sorted(set(g)) for g in merge_groups if len(g) > 1]
-    ids, n = merge_track_ids(kps, ids, groups)
-    target = {t: t for t in range(len(fragments))}
-    for g in groups:
-        for t in g:
-            target[t] = g[0]
-    kept = sorted(set(target.values()))
-    merged = [sum(fragments[t] for t in target if target[t] == k) for k in kept]
-    return ids, n, merged
-
-
 def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo]:
     """Stabilize tracks and return one thumbnail + summary per track.
 
@@ -134,13 +119,15 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
     ids/labels are then for the merged view.
     """
     run_dir = Path(run_dir)
+    if video_path:
+        _save_source_video(run_dir, video_path)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks, info = cached_stabilize(det)
+    ids, n_tracks, info = stable_track_ids(det, merge_groups, return_info=True)
     if n_tracks == 0:
         raise ValueError("no persistent people found (all detections were short-lived)")
-    ids, n_tracks, fragments = _apply_merges(det.kps, ids, info["fragments"], merge_groups)
+    fragments = info["fragments"]
 
     occurrences: list[list[tuple[int, int]]] = [[] for _ in range(n_tracks)]
     for f, a in enumerate(ids):
@@ -237,14 +224,14 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"unknown reference_mode {reference_mode!r}")
     run_dir = Path(run_dir)
+    if video_path:
+        _save_source_video(run_dir, video_path)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks, _ = cached_stabilize(det)
+    ids, n_tracks = stable_track_ids(det, merge_groups)
     if n_tracks == 0:
         raise ValueError("no persistent dancers found (all detections were short-lived)")
-    if merge_groups:
-        ids, n_tracks = merge_track_ids(det.kps, ids, merge_groups)
     dense = to_dense(det.kps, ids, n_tracks)
     if selected_tracks is not None:
         if not selected_tracks:

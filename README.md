@@ -1,100 +1,160 @@
 # DanceDanceConvolution
 
-Pose-detection demos: run pose estimation on a webcam, video, or image, show
-an annotated preview, and stream per-frame keypoint signals as JSON Lines so
-a separate process (e.g. a model consuming pose-sequence windows) can pick
-them up. Three detectors are available in the web UI / `video_pipeline.py`:
+DanceDanceConvolution analyzes saved videos in a local Gradio app. It detects
+people, lets you correct their tracks and dancer labels, predicts dancers with
+five LASSO selected pose features and an LSTM, and compares selected dancers
+against a pose reference. Training records live in SQLite; videos and pose
+tracks remain in their run folders.
 
-| | Multi-person | Hands | Notes |
-|---|---|---|---|
-| **YOLO** | Yes, no cap | No | Fastest. Measured 100% frame coverage on a 476-frame test clip. |
-| **RTMW** (recommended for hands) | Yes, no cap | Yes, linked to the right person | Slower than YOLO on CPU. Measured 99.9% of person-detections had a hand, on a 2-dancer clip -- see [Known limitations](#known-limitations). |
-| **MediaPipe** | Capped, needs a slider | Yes, but unreliable | Hands not linked to a body. Measured only 15% frame coverage on hands (0% with both hands at once) on a 1-dancer clip -- see [Known limitations](#known-limitations). |
+## Setup and launch
 
-- **`app.py`** + **`video_pipeline.py`** -- the main workflow: a local web UI
-  to upload a video, pick the dancers and see who deviates and when. See
-  [Web UI](#web-ui) below.
-- **`pose_demo.py`** -- YOLO11 pose, live webcam demo. Fast, 17-keypoint COCO
-  body pose only (no hands).
-- **`mediapipe_pose_demo.py`** -- MediaPipe PoseLandmarker + HandLandmarker,
-  live webcam demo. 33-keypoint body pose *plus* 21 landmarks per hand
-  (fingers included), same hand-reliability caveat as above.
+Create a virtual environment, install the dependencies, and launch the app:
 
-## Setup
-
-Use a virtualenv for this project rather than your system/base Python --
-`mediapipe`, `gradio`, and friends pull in a lot of transitive dependencies
-that can clash with unrelated packages otherwise.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-`pose_demo.py`'s weights (`yolo11n-pose.pt`) and the MediaPipe models
-(`models/*.task`) download automatically on first run. `video_pipeline.py`'s
-overlay export uses `ffmpeg` if it's on your `PATH` (`brew install ffmpeg`)
-to produce a browser-playable H.264 file; without it, the overlay is still
-written but in a codec most browsers won't preview inline.
-
-## Web UI
-
-```bash
 python app.py
 ```
 
-Opens a local Gradio app at http://127.0.0.1:7860. One page, three steps; each
-step opens the next by itself:
+The app opens at `http://127.0.0.1:7860`. Set `DDC_RUNS_DIR` to store runs
+outside `./runs`. `ffmpeg` on `PATH` enables browser compatible H.264 overlays.
+The detector weights download on first use. Use one running app per run
+directory, especially when the SQLite database is synced by OneDrive.
 
-1. **Video** -- upload a clip and click *Analyze video*, or pick a clip you
-   already analyzed under *Previous runs* and click *Open run*. The uploaded
-   video is kept with the run, so it is never asked for again.
-2. **Dancers** -- everyone found in the clip, with the predicted dancers
-   already ticked. Fix the ticks if needed, choose what to compare against,
-   click *Compare dancers*.
-3. **Results** -- the deviation overlay video beside the timeline. A line on
-   the timeline follows the video; clicking the timeline, dragging *Inspect
-   time* or clicking a *Worst moments* row jumps the video there.
+## Video and GUI workflow
 
-The pose model is under *Pose model (advanced)* in step 1:
+1. **Video:** Upload a video and select YOLO, RTMW, or MediaPipe; click
+   **Analyze video**. You can reopen an earlier run under **Previous runs**.
+   Each run saves the source video, `tracking.jsonl`, `meta.json`, and an
+   annotated overlay under `runs/<run>/`. Raw tracking files remain
+   downloadable from the Video tab.
+2. **Dancers:** The app lists persistent people with a visibility timeline and
+   thumbnails. Review the predicted dancer checklist. Use **Render preview
+   of the ticked dancers** to make a cached preview on demand. To combine
+   fragments of one person, select them in **Same person listed twice?
+   Merge**, then click **Save merges**. **Reset merges** and **Save merges**
+   undo a saved correction. Review the checklist again after a merge changes
+   person numbers. **Save reviewed labels** records a corrected checklist.
+   **Compare dancers** confirms the originally displayed predictions when
+   no review was saved; it does not record unsaved checklist edits.
+3. **Results:** Compare the selected dancers with the group composite, one
+   dancer from the clip, or a separate solo video. The deviation overlay,
+   timeline, worst moments table, inspect time control, and video seeking are
+   interactive. A solo video may need a time offset to align it with the
+   analyzed clip.
 
-- **YOLO** (body only, fast) -- no configuration needed.
-- **RTMW** (body + hands, multi-person) -- recommended when you need hands;
-  no configuration needed, no person-count cap.
-- **MediaPipe** (body + hands) -- set "Number of people in video" to at
-  least how many dancers are in frame (defaults to 4); expect hands to drop
-  out often (see the table above).
+YOLO detects COCO body keypoints quickly. RTMW detects multiple people and
+links hands to each person's body; use it when hand tracking matters.
+MediaPipe supplies body and hand landmarks, but its hands are not reliably
+linked to a person. MediaPipe runs can be tracked and downloaded; the GUI's
+dancer review and pose comparison use YOLO or RTMW runs. Detection remains separate
+from classifying a tracked person as a dancer.
 
-MediaPipe runs are tracking-only (they can't be compared in steps 2-3).
+### Stable tracks and saved merges
 
-Each run writes to `runs/<timestamp>/`: `overlay.mp4` (annotated video),
-`source.<ext>` (the upload), `meta.json` (file name, model, length -- used to
-name the run in *Previous runs*) and `tracking.jsonl` (one JSON record
-per frame -- formats documented below,
-`t` is seconds into the video, i.e. `frame / fps`, not wall-clock time,
-since this is for analyzing a recorded clip rather than a live feed). The
-overlay and JSONL can also be downloaded under *Raw tracking output* in step 1.
-Set `DDC_RUNS_DIR` to keep runs somewhere other than `./runs`.
+`ddc.tracking.stable_track_ids` associates detections through motion, body
+geometry, and saved source video clothing descriptors. It stitches compatible
+fragments after brief dropouts and preserves explicit YOLO tracker IDs.
+The same IDs feed the people list, feature extraction, preview, dancer
+prediction, and comparison. Clothing descriptors help identity matching;
+they are not dancer classifier inputs.
 
-`video_pipeline.py` has the underlying `analyze_video_yolo()`,
-`analyze_video_rtmw()`, and `analyze_video_mediapipe()` functions if you want
-to call them directly from a script instead of the UI.
+**Save merges** writes `merge_review.json` and teaches a separate identity
+matching model from confirmed same person pairs and simultaneously visible
+different person pairs. Its weights live in `runs/identity_model.json`. New
+analyses save identity predictions before dancer screening, so reopening a
+run retains its person numbers. Saved merges are also recorded in
+`merges.json` beside reviewed `labels.csv`. A stale label review is excluded
+when tracking inputs or person numbers change.
 
-### One person, one track (step 2)
+Identity matching can still split or mix people after long occlusions.
+Review and save merges in the GUI when the people list is wrong. Saving a
+merge does not label anyone as a dancer.
 
-The frame-to-frame tracker forgets someone after ~0.3 s, so occlusions and detection
-dropouts used to come back as new "people". `ddc.tracking.stabilize` now joins those
-fragments afterwards (`stitch_tracklets`): fragments that never appear in the same
-frame and line up in position, size and motion across the gap (up to 5 s) become one
-person, *before* short tracks are discarded. On a 5-dancer clip this took 19 raw
-tracks to exactly 5. Step 2 shows a "when each person is visible"
-timeline and how many fragments were joined into each person.
+## Fifteen validated training videos
 
-Geometry only (no appearance model), so people who cross paths or re-enter near each
-other can still be mixed up or left split. Under "Same person listed twice? Merge" in
-step 2, tick the duplicates and click Merge (Reset merges undoes it); on the
-CLI use `--list-tracks` then `--merge 2,5` (repeatable).
+The training cohort accepts the first **15 completed runs with a saved,
+current dancer/non_dancer label for every merged track**. Analyzed but
+unreviewed runs wait for validation and do not count toward the 15. The
+reviewed videos are used for rolling training: as enough labeled examples
+become available, each newly validated run refits LASSO and the LSTM using
+the eligible cohort. When the fifteenth validated run completes a successful
+fit, the models are frozen. Later videos use the fitted models to predict
+dancers from their saved merged tracks; they do not add training records or
+change model weights. Saved identity merge reviews can continue to improve
+track association independently.
+
+Start or inspect the cohort through the app or CLI:
+
+```powershell
+python -m ddc.training arm
+python -m ddc.training status
+python -m ddc.training refresh
+python -m ddc.training export
+python -m ddc.training backup --output backups/lasso-lstm-training.sqlite3
+```
+
+`arm` excludes runs that already existed before the cohort was armed.
+Reopening a run never consumes another slot. The CLI also supports
+`import-review --workbook edited_registry.xlsx` for workbook label
+reviews. `--runs-dir` and `DDC_RUNS_DIR` select the run directory.
+
+### Feature labels and model inputs
+
+The feature catalog has 40 named fields: 10 time, 8 frequency, 8 time
+frequency, 9 biomechanics, and 5 human related fields. The human fields
+describe external reports or the reviewed target. Age, health, gender,
+fatigue, camera position, detected size, pixels, audio, and clothing are
+not inferred from video or used as dancer predictors.
+
+LASSO uses standardized pose feature values and human reviewed labels
+(`dancer=1`, `non_dancer=0`). It chooses five nonzero coefficients by
+video grouped cross validation. The registry labels each selected feature
+and shows its coefficient and direction: positive means **more dancer-like**
+as that feature rises; negative means **more non-dancer-like**. The LASSO
+linear score is not a calibrated dancer probability.
+
+The LSTM receives exactly those five selected feature measurements in the
+same order, measured in nine overlapping windows of the middle five seconds
+of each usable track. Its input shape is `(tracks, 9, 5)`. Missing value
+medians and standardization come from reviewed training windows and are
+reused at prediction. The LSTM outputs the dancer label and its probability.
+Sequences with insufficient pose coverage or long tracking gaps are marked
+unavailable. LASSO scores and coefficients do not enter the LSTM tensor.
+
+The GUI predicts against the currently merged track IDs. A saved human
+review provides training labels only while the 15 run cohort is still open.
+Prediction alone never turns an unreviewed track into a training label.
+
+### Training data and registry
+
+`runs/lasso_lstm_training.sqlite3` is the authoritative training database.
+It stores cohort membership, validated reviews, cached feature values,
+model versions, selected LASSO coefficients, LSTM checkpoint metadata, and
+prediction snapshots. `runs/lasso_lstm_registry.xlsx` is the inspection
+workbook for the 15 enrolled, validated runs. It shows the labeled LASSO
+top five, feature weights, reviewed labels, and LSTM dancer predictions and
+probabilities. It is a generated export of SQLite and can be rebuilt with
+`python -m ddc.training export`. There is no separate dancer feature registry.
+
+Raw source video, `tracking.jsonl`, merge files, and feature sequence arrays
+remain in their run folders. Model artifacts and sequence caches are stored
+under `runs/training/` and `runs/<run>/training/`. Keep the run folders with
+SQLite when moving the project. The SQLite database commits before the Excel
+export. If Excel has the workbook open or the export runtime is unavailable,
+the database remains current and `status` reports a pending export; close the
+workbook and run `export` to retry. Excel export uses Node.js and
+`@oai/artifact-tool`; outside the bundled Codex runtime, set `DDC_NODE` and
+`DDC_ARTIFACT_MODULE_ROOT`.
+
+The SQLite `current_weights` and `current_predictions` views show the
+latest model snapshot. `model_versions`, `review_batches`, `snapshots`,
+`feature_values`, and `predictions` retain history. The `backup` command
+uses SQLite's backup API and requires a new destination file. Back up the
+run folders separately to preserve videos and pose arrays.
+
+## Comparing dancers
 
 ### Deviation reference (step 2)
 
@@ -121,234 +181,6 @@ reflects shape rather than small timing slips. The overlay's reference ghost and
 per-joint feedback use that matched pose. 0 is strictest; around 0.1–0.25 s forgives
 typical slips, while larger values can hide real mistakes in fast choreography.
 Applies to every reference mode. CLI: `--time-tolerance 0.25`.
-
-## Run the YOLO demo (body only, fast, live webcam)
-
-```bash
-python pose_demo.py
-```
-
-Opens your default camera, shows a live annotated preview, and writes one
-JSON record per frame to `pose_stream.jsonl`. Press `q` or `Esc` in the
-preview window to quit.
-
-Useful options:
-
-```bash
-python pose_demo.py --source video.mp4 --out out.jsonl   # process a video file
-python pose_demo.py --source photo.jpg --no-display       # process a single image
-python pose_demo.py --track                                # persistent per-person IDs (ByteTrack)
-python pose_demo.py --stdout --no-display | python examples/example_consumer.py
-```
-
-`--device` defaults to `cpu`. Ultralytics has a known MPS bug for pose
-models on Apple Silicon GPUs, so `mps` is opt-in via `--device mps`.
-
-## Run the MediaPipe demo (body + hands, live webcam)
-
-```bash
-python mediapipe_pose_demo.py
-```
-
-Same behavior as `pose_demo.py` -- live preview, `q`/`Esc` to quit, writes
-`pose_stream.jsonl` -- but also draws and streams hand/finger landmarks.
-
-```bash
-python mediapipe_pose_demo.py --source video.mp4 --out out.jsonl
-python mediapipe_pose_demo.py --num-poses 2 --num-hands 4   # track 2 people
-python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
-```
-
-## Evaluate dancer vs non-dancer pose features
-
-The detector deliberately labels every persistent person as a track; it does
-not infer whether somebody is dancing.  `ddc.dancer_features` collects five
-scale- and location-invariant track-level signals from a detector run:
-
-1. wrist height relative to the hips;
-2. wrist speed;
-3. limb extension (shoulder-to-wrist and hip-to-ankle reach);
-4. elbow/knee motion; and
-5. whole-pose motion.
-
-Create a small CSV which labels the tracks you have reviewed in a run:
-
-```csv
-track_id,label
-0,dancer
-1,dancer
-2,non_dancer
-3,non_dancer
-```
-
-Then run the evaluator (at least two tracks from each class are required):
-
-```bash
-python -m ddc.dancer_features runs/20261008-120000/tracking.jsonl labels.csv --out reports/my_run
-```
-
-It writes `track_features.csv`, `feature_selection_report.json`, and
-`feature_selection_accuracy.svg`.  The chart uses leave-one-track-out
-accuracy and compares each individual feature with three methods that select
-the best three features inside each validation fold: a **filter** (Fisher
-score), **wrapper** (greedy forward selection), and **embedded** (L1 logistic
-selection).  This prevents the accuracy graph from selecting features using
-the held-out track's label.
-
-For an end-to-end installation check only, use the synthetic example below.
-Its score is intentionally not a real-world model result.
-
-```bash
-python -m ddc.dancer_features --demo --out reports/synthetic_feature_demo
-```
-
-## Screen non-dancers before composite-pose analysis
-
-In the web UI, this screening happens in step 2 (**Dancers**). Opening a run
-there scores every saved track with the five standardized
-predictors displayed in `runs/dancer_feature_registry.xlsx` and pre-selects only
-the predicted dancers. It does
-**not** run pose detection again. The action also adds a Labels-style worksheet
-for the run. Use **Save reviewed labels** beside the checklist after changing
-the review: it updates Reviewed label, Validation status, and Correction
-recorded in that worksheet. Leaving the checklist unchanged and clicking
-**Compare** records the predictor labels as validated correct. Every saved
-review rebuilds `runs/dancer_feature_registry.xlsx`: its first sheet summarizes
-the five predictors, followed by one labels sheet per run and one detailed
-sheet per validated dancer track.
-
-**Render preview of the ticked dancers** draws a video of just the ticked people. It re-encodes the
-whole clip, so it only runs when you click it, at up to 720p (using the hardware decoder and
-encoder on macOS). Renders are cached under `runs/<run>/overlays/`, keyed on the run, merges,
-ticked dancers and source video, so repeating a request is instant; the three newest are kept
-per run.
-
-Track ids come from `ddc.tracking.stable_track_ids` (automatic stitching plus any manual
-merges), the same numbering the step 2 people list shows. Merging people re-scores the
-renumbered list, and **Save reviewed labels** stores the run's merges in `merges.json` beside
-`labels.csv` so labels keep pointing at the same people. `labels.csv` files written before
-track stitching used the old numbering; delete them (and `prediction_validation.json` /
-`feature_inventory.json`) and relabel those runs.
-
-Predictions for a run come from a model trained on *other* runs only, and
-camera-framing features (frame position, clip length, detected size) are never
-used as predictors. The Excel workbook (`runs/dancer_feature_registry.xlsx`) is written
-with `openpyxl`; if it cannot be built, comparing still works and shows a note.
-
-**Known limitation:** this script uses MediaPipe's `VIDEO` running mode for
-live tracking continuity, but `PoseLandmarker` in `VIDEO`/`LIVE_STREAM` mode
-caps at 1 detected person regardless of `--num-poses` (its cross-frame
-tracking only follows a single ROI; tested against `mediapipe==0.10.31`).
-`video_pipeline.py`/`app.py` avoid this by running each frame as an
-independent `IMAGE`-mode detection instead, since they don't need live
-temporal tracking. If reliable multi-person live tracking turns out to
-matter, switching this script to the same `IMAGE`-mode-per-frame approach is
-the fix -- at the cost of the smoothing `VIDEO` mode provides.
-
-## Pose signal format (`pose_demo.py`)
-
-Each line of the output file is one JSON object:
-
-```json
-{"frame": 12, "t": 1699999999.1234, "people": [
-  {"id": 0, "bbox": [x1, y1, x2, y2], "conf": 0.93,
-   "keypoints": {"nose": [x, y, conf], "left_shoulder": [x, y, conf], ...}}
-]}
-```
-
-`keypoints` has all 17 COCO keypoints (`nose`, `left_eye`, `right_eye`,
-`left_ear`, `right_ear`, `left_shoulder`, `right_shoulder`, `left_elbow`,
-`right_elbow`, `left_wrist`, `right_wrist`, `left_hip`, `right_hip`,
-`left_knee`, `right_knee`, `left_ankle`, `right_ankle`), each as
-`[x_pixels, y_pixels, confidence]`. `id` is a stable per-person track ID when
-run with `--track`, otherwise a per-frame detection index.
-
-See [`examples/example_consumer.py`](examples/example_consumer.py) for a
-minimal reader that consumes the stream from a file or via stdin.
-
-## Pose signal format (`analyze_video_rtmw` / RTMW)
-
-Same `people` structure as above (and `examples/example_consumer.py` reads
-it unmodified), extended with feet and per-person-linked hands:
-
-```json
-{"frame": 12, "t": 0.4, "people": [
-  {"id": 0, "bbox": [x1, y1, x2, y2], "conf": 0.93,
-   "keypoints": {"nose": [x, y, conf], "left_shoulder": [x, y, conf], ...,
-                 "left_big_toe": [x, y, conf], ...,
-                 "left_hand_wrist": [x, y, conf], "left_hand_thumb_tip": [x, y, conf], ...,
-                 "right_hand_wrist": [x, y, conf], ...}}
-]}
-```
-
-`keypoints` has the same 17 COCO body points as `pose_demo.py`, plus 6 feet
-points (`left_big_toe`, `left_small_toe`, `left_heel`, and the `right_`
-equivalents), plus 21 `left_hand_*`/21 `right_hand_*` points (only included
-when that hand's detection confidence clears `hand_conf`, default 0.3) --
-all `[x_pixels, y_pixels, confidence]`. Unlike MediaPipe, hands are always
-keyed to the same person `id` they belong to. There's no cross-frame
-tracking (no `--track` equivalent), so `id` is a per-frame detection index,
-not a stable identity -- add a tracker (e.g. IoU or ByteTrack over the
-`bbox`es) if you need persistent per-dancer IDs across frames. `mode` can be
-`"performance"` (most accurate, slowest), `"balanced"`, or `"lightweight"`
-(default -- ~15 FPS on CPU in testing, ~4x faster than `"balanced"` with a
-modest accuracy cost).
-
-## Pose signal format (`mediapipe_pose_demo.py`)
-
-```json
-{"frame": 12, "t": 1699999999.1234,
- "poses": [{"id": 0, "landmarks": {"nose": [x, y, z, visibility], "left_shoulder": [x, y, z, visibility], ...}}],
- "hands": [{"handedness": "Left", "score": 0.95, "landmarks": {"wrist": [x, y, z], "thumb_tip": [x, y, z], ...}}]}
-```
-
-`poses[].landmarks` has all 33 BlazePose body points, each
-`[x_pixels, y_pixels, z_relative, visibility]`. `hands[].landmarks` has all
-21 hand points, each `[x_pixels, y_pixels, z_relative]`. `z` is relative
-depth (roughly hip-depth-normalized, not metric), not directly comparable to
-YOLO's pixel-space output. `handedness` is from the subject's own
-perspective (mirrored relative to the camera), and hands are **not** linked
-to a specific `poses[].id` -- matching a hand to a body is left to the
-consumer if needed. `id` is a per-frame list index, not a stable track ID
-across frames.
-
-## Known limitations
-
-**MediaPipe's hand detection is unreliable on real footage.** Measured on a
-476-frame (~16s) single-dancer test clip processed through the web UI:
-
-| | YOLO (body) | MediaPipe (body) | MediaPipe (hands) |
-|---|---|---|---|
-| Frames with a detection | 476/476 (100%) | 469/476 (98.5%) | 73/476 (15.3%) |
-| Frames with both instances at once | -- | -- | 0/476 (0%) |
-| Longest dropout streak | -- | -- | 155 consecutive frames |
-
-MediaPipe's body pose is solid (comparable to YOLO), but `HandLandmarker`
-runs on the full downscaled frame, where a hand is a small, often
-motion-blurred region -- it drops out constantly and never picked up both
-hands simultaneously in this clip. This is why RTMW is the recommended
-choice when hand data matters: as a top-down pipeline (person detector, then
-pose *on a crop of that person*), it gives the hand detector far more
-effective resolution on the hand itself. If you need MediaPipe specifically
-(e.g. its face mesh), the fix would be to crop around each wrist (from body
-keypoints) before running `HandLandmarker`, rather than run it on the whole
-frame -- not currently implemented.
-
-**RTMW confirmed reliable on a real 2-dancer clip.** Measured on a 786-frame
-test clip processed through the web UI:
-
-| | Result |
-|---|---|
-| Frames with >=1 person | 667/786 (84.9%) |
-| Person-instances with >=1 hand | 1340/1342 (99.9%) |
-| Person-instances with both hands | 1335/1342 (99.5%) |
-| Person-count distribution | 2 people: 659 frames, 3 people: 8 frames (brief false positive), 0 people: 119 frames |
-
-The 119 zero-person frames are all one contiguous block at the very end of
-the clip (frames 667-786) -- consistent with the dancers leaving frame
-before the clip ends, not a detection dropout. In every frame where a person
-*was* detected, hands came through essentially every time (99.9%), a sharp
-contrast with MediaPipe's 15.3% hand coverage on comparable footage above.
 
 ### Coaching dashboard (step 3)
 
@@ -454,3 +286,18 @@ With a dancer selected, **Download report** saves their report as a standalone
 HTML page (score, coverage, personalized feedback, practice moments involving
 them, worst moments, and how scores work) to `runs/<run>/reports/`. It opens in
 any browser and prints cleanly, so it can be shared with the dancer directly.
+
+## Direct analysis and data format
+
+`video_pipeline.py` exposes `analyze_video_yolo`, `analyze_video_rtmw`, and
+`analyze_video_mediapipe` to other Python code. `python -m ddc.analyze
+runs/<run> --reference dancer --reference-dancer 0` compares against one
+saved dancer; `--reference solo --solo-video solo.mp4 --solo-offset 0.5`
+uses a separate solo video.
+
+Every line of `tracking.jsonl` is a JSON frame with `frame`, `t` (seconds
+from the start of the clip), and detected `people`. Each person has an ID,
+bounding box, confidence, and named pose keypoints. RTMW extends the COCO
+body points with feet and linked `left_hand_*` / `right_hand_*` points.
+MediaPipe records poses and hands separately. RTMW detection indices are per
+frame; `ddc.tracking` supplies persistent IDs for the GUI and models.
