@@ -1,3 +1,4 @@
+import pytest
 import json
 
 import numpy as np
@@ -10,6 +11,8 @@ def test_app_builds_and_lists_runs_with_readable_labels(tmp_path, monkeypatch):
     import app
 
     assert app.demo is not None
+    assert not any(getattr(block, "label", None) == "Ten-video supervised training"
+                   for block in app.demo.blocks.values())
 
     new = tmp_path / "20261010-144020"
     old = tmp_path / "20260929-161605"
@@ -274,3 +277,150 @@ def test_practice_moment_errors_leave_results_usable(tmp_path, monkeypatch):
                               False, 5, app.REF_COMPOSITE, None, None, 0)
     assert outputs[12] == []
     assert 'Practice moments unavailable' in outputs[6]
+
+
+def test_compare_before_save_confirms_original_predictions_despite_unsaved_edits(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "_LAST", {
+        "predictions": [{"track_id": 0, "predicted_label": "dancer"},
+                        {"track_id": 1, "predicted_label": "non_dancer"}], "merges": []})
+    calls = []
+    def validate(root, name, selected, predicted, **kwargs):
+        calls.append((selected, kwargs["review_action"]))
+        return {"validation": {"status": "validated_correct", "corrected_track_ids": []}}
+    monkeypatch.setattr(app, "validate_checklist", validate)
+    note = app._validate_comparison("run", [1])
+    assert calls == [([0], "compare_confirmed")]
+    assert "all correct" in note
+    assert "Unsaved" in note
+    assert app._LAST["saved_selection"] == frozenset({0})
+
+
+def test_compare_keeps_saved_corrections_even_when_checklist_returns_to_predictions(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "_LAST", {"saved_selection": frozenset({1}),
+        "saved_validation": {"corrected_track_ids": [0,1]},
+        "predictions": [{"track_id": 0, "predicted_label": "dancer"}]})
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Compare must not rewrite an existing saved review")
+    monkeypatch.setattr(app, "validate_checklist", unexpected)
+    assert "retained" in app._validate_comparison("run", [0])
+    assert app._LAST["saved_selection"] == frozenset({1})
+
+
+def test_compare_without_predictions_does_not_invent_validation_labels(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "_LAST", {"predictions": []})
+    assert "Save reviewed labels" in app._validate_comparison("run", [0])
+
+
+def test_save_merges_button_and_reopening_use_original_automatic_ids(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+    from ddc.identity_learning import save_merge_review
+
+    run = _run(tmp_path, "review")
+    save_merge_review(run, [[0, 2]])
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    monkeypatch.setattr(app, "_predict_people",
+                        lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
+    out = app.run_detect(run.name)
+    assert len(out) == app.N_PEOPLE_OUTPUTS
+    assert len(out[0]) == 2
+    assert app._LAST["n_auto"] == 3  # further merges must use original ids
+    assert app._LAST["merges"] == [[0, 2]]
+    assert any(getattr(block, "value", None) == "Save corrections" for block in app.demo.blocks.values())
+    assert "Corrections saved" in app.run_save_merges(run.name)
+
+    reset = app.run_reset_merges(run.name)
+    assert len(reset[0]) == 3
+    assert "Unsaved" in reset[-1]
+    assert "Corrections saved" in app.run_save_merges(run.name)
+    assert len(app.run_detect(run.name)[0]) == 3
+
+
+def test_cumulative_merges_remain_correct_after_reopening(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+    from ddc.identity_learning import save_merge_review
+
+    run = _run(tmp_path, "review", fragments=3)
+    save_merge_review(run, [[0, 2]])
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    monkeypatch.setattr(app, "_predict_people",
+                        lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
+    app.run_detect(run.name)
+    labels = app._LAST["track_labels"]
+    app.run_merge(run.name, [labels[0], labels[2]])
+    assert app._LAST["merges"] == [[0, 2, 3]]
+    app.run_save_merges(run.name)
+    assert len(app.run_detect(run.name)[0]) == 2
+    assert app._LAST["merges"] == [[0, 2, 3]]
+
+
+def test_saving_merges_refreshes_predictions_from_persisted_groups(tmp_path, monkeypatch):
+    import app
+    from test_identity_learning import _run
+
+    run = _run(tmp_path, "review")
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    scored_groups = []
+
+    def predict(name, groups, tracks):
+        scored_groups.append(groups)
+        return [tr.label for tr in tracks], "test"
+
+    monkeypatch.setattr(app, "_predict_people", predict)
+    app.run_detect(run.name)
+    labels = app._LAST["track_labels"]
+    app.run_merge(run.name, [labels[0], labels[2]])
+    message = app.run_save_merges(run.name)
+
+    scored_groups.clear()
+    shown = app.refresh_saved_merges(run.name, message)
+    assert scored_groups == [[[0, 2]]]
+    assert app._LAST["merges"] == [[0, 2]]
+    assert shown[-1] == message
+
+
+def test_split_swap_undo_and_saved_edit_log_reopen(tmp_path, monkeypatch):
+    import json
+    import app
+    from test_identity_learning import _run
+
+    run = _run(tmp_path, "edits")
+    monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app, "_LAST", {})
+    monkeypatch.setattr(app, "_predict_people",
+                        lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
+    out = app.run_detect(run.name)
+    labels = out[1]["choices"]
+    n = len(labels)
+    from ddc.io import load_jsonl
+    from ddc.tracking import stable_track_ids
+    ids, _ = stable_track_ids(load_jsonl(run / "tracking.jsonl"))
+    seen = [f for f, a in enumerate(ids) if 0 in a]          # frames where Person 1 is visible
+    t_mid = float(app._LAST["t"][seen[len(seen) // 2]])
+
+    with pytest.raises(app.gr.Error, match="exactly 1"):
+        app.run_split(run.name, labels[:2], t_mid)
+    split = app.run_split(run.name, labels[:1], t_mid)
+    assert len(split[0]) == n + 1 and app._LAST["history"][-1]["op"] == "split"
+    assert "1 split" in split[-1] and "Unsaved" in split[-1]
+    swapped = app.run_swap(run.name, split[1]["choices"][:2], 0, t_mid)
+    assert len(swapped[0]) == n + 1 and len(app._LAST["history"]) == 2
+    undone = app.run_undo(run.name)
+    assert len(undone[0]) == n + 1 and [e["op"] for e in app._LAST["history"]] == ["split"]
+
+    assert "Corrections saved" in app.run_save_merges(run.name)
+    saved = json.loads((run / "merges.json").read_text())
+    assert saved == [{"op": "split", "person": 0, "frame": app._LAST["history"][0]["frame"]}]
+    reopened = app.run_detect(run.name)
+    assert len(reopened[0]) == n + 1 and app._LAST["history"] == saved
+    assert "restored" in reopened[-1]
+    assert len(app.run_undo(run.name)[0]) == n
+    with pytest.raises(app.gr.Error, match="Nothing to undo"):
+        app.run_undo(run.name)

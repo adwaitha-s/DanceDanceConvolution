@@ -9,7 +9,7 @@ Usage:
     python pose_demo.py                          # webcam 0, cpu, writes pose_stream.jsonl
     python pose_demo.py --source video.mp4 --out out.jsonl
     python pose_demo.py --source photo.jpg --no-display
-    python pose_demo.py --track --stdout | python examples/example_consumer.py
+    python pose_demo.py --track --stdout --no-display
 """
 
 from __future__ import annotations
@@ -57,7 +57,8 @@ def frame_to_record(frame_idx: int, timestamp: float, result) -> dict:
                 person["keypoints"][name] = [round(x, 1), round(y, 1), round(float(c), 3)]
         people.append(person)
 
-    return {"frame": frame_idx, "t": round(timestamp, 4), "people": people}
+    return {"frame": frame_idx, "t": round(timestamp, 4), "people": people,
+            "id_type": "track" if has_ids else "detection"}
 
 
 def open_source(source: str):

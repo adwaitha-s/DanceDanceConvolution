@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from ddc.dancer_features import write_synthetic_demo
+from test_data import write_synthetic_demo
 from ddc.overlay_cache import overlay_key, render_dancer_overlay
 
 
@@ -64,3 +64,11 @@ def test_jsonl_keeps_original_coordinates_and_only_dancers(run):
     assert {p["stable_track_id"] for p in people} == {0, 1}
     # Rendered at half size these boxes would end near x=190; the JSONL keeps source pixels.
     assert max(p["bbox"][2] for p in people) > 300
+
+
+def test_tracking_change_invalidates_cached_overlay(run, monkeypatch):
+    import ddc.overlay_cache as cache
+    source = run / "source.mp4"
+    old_key = overlay_key(run, source, None, [0], 720)
+    monkeypatch.setattr(cache, "TRACKING_VERSION", cache.TRACKING_VERSION + 1)
+    assert overlay_key(run, source, None, [0], 720) != old_key

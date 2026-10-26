@@ -1,15 +1,43 @@
 """Stabilize per-frame detections into consistent dancer tracks.
 
-RTMW ids are per-frame indices and swap between frames, so we re-associate
-detections across frames with Hungarian matching.
+RTMW ids are per-frame indices and swap between frames. Associate those
+detections using torso motion, size and pose; preserve explicit tracker ids.
 """
 
 from __future__ import annotations
+
+from collections import OrderedDict
+import hashlib
+import inspect
+import json
+import warnings
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .skeleton import CONF_THR, J
+from .appearance import (appearance_distance, appearance_matrix, combine_appearances,
+                         load_appearances, source_stamp)
+from .smoothing import nan_moving_mean
+
+
+TRACKING_VERSION = 2
+_TRACK_CACHE = OrderedDict()
+
+
+def baseline_stamp(path):
+    """Inputs to the motion/appearance tracker, before learned and manual joins."""
+    from pathlib import Path
+    stat = Path(path).stat()
+    return [TRACKING_VERSION, stat.st_size, stat.st_mtime_ns, source_stamp(path)]
+
+
+def tracking_stamp(path):
+    """Include the frozen identity model decisions in all downstream cache keys."""
+    from .identity_learning import prediction_stamp
+    stamp = baseline_stamp(path)
+    identity = prediction_stamp(path)
+    return stamp + [identity] if identity is not None else stamp
 
 
 def _size(p: np.ndarray) -> float:
@@ -34,20 +62,53 @@ def _cost(a: np.ndarray, b: np.ndarray) -> float:
     return d / _size(a)
 
 
-def _dedupe(frame: np.ndarray, dup_cost: float = 0.4) -> np.ndarray:
+def _sizes(poses: np.ndarray) -> np.ndarray:
+    """`_size` for each of (N,17,3) poses at once."""
+    ok = poses[..., 2] >= CONF_THR
+    torso = [J["left_shoulder"], J["right_shoulder"], J["left_hip"], J["right_hip"]]
+    sh = poses[:, [J["left_shoulder"], J["right_shoulder"]], :2].mean(1)
+    hp = poses[:, [J["left_hip"], J["right_hip"]], :2].mean(1)
+    with np.errstate(invalid="ignore"):
+        torso_len = np.linalg.norm(sh - hp, axis=1)
+    pts = np.where(ok[..., None], poses[..., :2], np.nan)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        extent = np.linalg.norm(np.nanmax(pts, 1) - np.nanmin(pts, 1), axis=1) * 0.4
+    out = np.where(ok.sum(1) >= 2, np.maximum(np.nan_to_num(extent, nan=1.0), 1.0), 1.0)
+    return np.where(ok[:, torso].all(1), np.maximum(np.nan_to_num(torso_len, nan=1.0), 1.0), out)
+
+
+def _cost_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """C[i, j] = `_cost(a[i], b[j])` for (A,17,3) and (B,17,3) poses."""
+    both = (a[:, None, :, 2] >= CONF_THR) & (b[None, :, :, 2] >= CONF_THR)
+    with np.errstate(invalid="ignore"):
+        d = np.linalg.norm(a[:, None, :, :2] - b[None, :, :, :2], axis=-1)
+    n = both.sum(-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(both, d, 0.0).sum(-1) / n
+    return np.where(n >= 3, mean / _sizes(a)[:, None], np.inf)
+
+
+def _dedupe(frame: np.ndarray, dup_cost: float = 0.15, appearances=None) -> np.ndarray:
     """Boolean keep-mask: drop near-identical detections of the same person.
 
     The detector sometimes emits two overlapping skeletons for one dancer; keep
-    the one with more visible joints / higher mean confidence.
+    the one with more visible joints / higher mean confidence. Pairs whose clothing
+    clearly differs are never treated as duplicates.
     """
     n = len(frame)
     keep = np.ones(n, bool)
+    if n < 2:
+        return keep
     quality = [((p[:, 2] >= CONF_THR).sum(), np.nanmean(p[:, 2])) for p in frame]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if keep[i] and keep[j] and min(_cost(frame[i], frame[j]),
-                                           _cost(frame[j], frame[i])) < dup_cost:
-                keep[j if quality[i] >= quality[j] else i] = False
+    C = _cost_matrix(frame, frame)
+    close = np.minimum(C, C.T) < dup_cost
+    if appearances is not None:
+        with np.errstate(invalid="ignore"):
+            close &= ~(appearance_matrix(appearances, appearances) > .25)
+    for i, j in zip(*np.nonzero(np.triu(close, 1))):   # row-major, same order as a double loop
+        if keep[i] and keep[j]:
+            keep[j if quality[i] >= quality[j] else i] = False
     return keep
 
 
@@ -62,48 +123,127 @@ def _center(p: np.ndarray) -> np.ndarray:
 
 def _smoothed_centers(cs: np.ndarray, win: int = 5) -> np.ndarray:
     """Moving nanmean of (n,2) centers so one flailing frame doesn't decide a link."""
-    out = np.full_like(cs, np.nan)
-    h = win // 2
-    for i in range(len(cs)):
-        seg = cs[max(0, i - h): i + h + 1]
-        if np.isfinite(seg).any():
-            out[i] = np.nanmean(seg, axis=0)
-    return out
+    return nan_moving_mean(cs, win)
 
 
-def _make_group(occ: list, kps: list, members: list) -> dict:
+def _box_size(box):
+    if box is None:
+        return np.nan
+    box = np.asarray(box, float)
+    return float(np.linalg.norm(box[2:] - box[:2])) if np.isfinite(box).all() else np.nan
+
+
+def _make_group(occ: list, kps: list, members: list, appearances=None, boxes=None) -> dict:
     """Arrays describing a set of detections of (what may be) one person, by frame."""
     occ = sorted(occ)
     cs = np.array([_center(kps[f][i]) for f, i in occ])
     return {"occ": occ, "members": members,
             "frames": np.array([f for f, _ in occ]),
             "centers": _smoothed_centers(cs),
-            "sizes": np.array([_size(kps[f][i]) for f, i in occ])}
+            "sizes": np.array([_size(kps[f][i]) for f, i in occ]),
+            "appearance": combine_appearances([appearances[f][i] for f, i in occ])
+                          if appearances is not None else None,
+            "extents": np.array([_box_size(boxes[f][i]) for f, i in occ]) if boxes is not None else None}
 
 
-def _link_cost(a: dict, b: dict, fps: float, max_gap: int, max_overlap: int = 3,
-               dup_dist: float = 0.6, k: int = 8) -> float:
+def _velocity(frames, centers) -> np.ndarray:
+    """Robust translation per frame, without extrapolating limb movement."""
+    if len(frames) < 2:
+        return np.zeros(2)
+    steps = np.diff(centers, axis=0) / np.diff(frames)[:, None]
+    valid = np.isfinite(steps).all(axis=1)
+    return np.median(steps[valid], axis=0) if valid.any() else np.zeros(2)
+
+
+def _prediction(state: dict, f: int) -> dict:
+    frames, centers, sizes = zip(*state["history"])
+    gap = f - state["last"]
+    return {"pose": state["pose"], "center": centers[-1], "gap": gap,
+            "appearance": state["appearance"],
+            "extent": float(np.median(state["extents"])) if state["extents"] else np.nan,
+            "size": float(np.median(sizes)),
+            "predicted": centers[-1] + _velocity(np.asarray(frames), np.asarray(centers)) * gap}
+
+
+def _association_cost(state: dict, p: np.ndarray, center: np.ndarray,
+                      size: float, max_cost: float, appearance=None, extent=np.nan) -> float:
+    """Match the predicted torso, allowing pose changes without changing identity."""
+    gap = state["gap"]
+    distance = float(np.linalg.norm(center - state["predicted"])) / state["size"]
+    # An old track must not grab a neighbour simply because its limbs look similar.
+    if not distance <= min(max_cost, 0.8 + 0.1 * (gap - 1)):
+        return np.inf
+    size_change = abs(float(np.log(size / state["size"])))
+    if size_change > np.log(2.5):
+        return np.inf
+    color = appearance_distance(state["appearance"], appearance)
+    if color is not None and color > .8:
+        return np.inf
+    extent_change = abs(float(np.log(extent / state["extent"]))) if extent > 0 and state["extent"] > 0 else 0.0
+    if extent_change > np.log(2.5):
+        return np.inf
+    previous = state["pose"]
+    both = (previous[:, 2] >= CONF_THR) & (p[:, 2] >= CONF_THR)
+    if both.sum() < 3:
+        return np.inf
+    delta = (previous[both, :2] - state["center"]) - (p[both, :2] - center)
+    pose_cost = np.linalg.norm(delta, axis=1).mean() / state["size"]
+    return (distance + 0.15 * pose_cost + 0.5 * size_change + extent_change
+            + 0.03 * (gap - 1) + 1.5 * (color or 0))
+
+
+def _association_matrix(preds: list, frame: np.ndarray, centers: np.ndarray, sizes: np.ndarray,
+                        max_cost: float, appearances=None, extents=None) -> np.ndarray:
+    """C[i, j] = `_association_cost(preds[j], frame[i], ...)` for every detection and track."""
+    P, A = len(frame), len(preds)
+    pred_c = np.array([q["predicted"] for q in preds])            # (A,2)
+    last_c = np.array([q["center"] for q in preds])               # (A,2)
+    size_a = np.array([q["size"] for q in preds])                 # (A,)
+    ext_a = np.array([q["extent"] for q in preds])
+    gap = np.array([q["gap"] for q in preds], float)
+    poses_a = np.stack([q["pose"] for q in preds])                # (A,17,3)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        distance = np.linalg.norm(centers[:, None] - pred_c[None], axis=-1) / size_a
+        gate = ~(distance <= np.minimum(max_cost, 0.8 + 0.1 * (gap - 1)))
+        size_change = np.abs(np.log(sizes[:, None] / size_a[None]))
+        gate |= size_change > np.log(2.5)
+        ext_d = np.full(P, np.nan) if extents is None else np.asarray(extents, float)
+        both_ext = (ext_d[:, None] > 0) & (ext_a[None] > 0)
+        extent_change = np.where(both_ext, np.abs(np.log(ext_d[:, None] / ext_a[None])), 0.0)
+        gate |= extent_change > np.log(2.5)
+        color = np.full((P, A), np.nan)
+        if appearances is not None:
+            color = appearance_matrix(appearances, [q["appearance"] for q in preds])
+        gate |= color > .8
+        both = (poses_a[None, :, :, 2] >= CONF_THR) & (frame[:, None, :, 2] >= CONF_THR)
+        delta = ((poses_a[None, :, :, :2] - last_c[None, :, None]) -
+                 (frame[:, None, :, :2] - centers[:, None, None]))
+        n = both.sum(-1)
+        pose_cost = np.where(both, np.linalg.norm(delta, axis=-1), 0.0).sum(-1) / n / size_a
+    gate |= n < 3
+    cost = (distance + 0.15 * pose_cost + 0.5 * size_change + extent_change
+            + 0.03 * (gap - 1) + 1.5 * np.nan_to_num(color, nan=0.0))
+    return np.where(gate, np.inf, cost)
+
+
+def _link_cost(a: dict, b: dict, fps: float, max_gap: int, k: int = 8) -> float:
     """Cost of `a` and `b` being the same person (inf = impossible).
 
     Two detections can't be one person if they're in the same frame, so groups
-    sharing frames never link -- except a few frames where both detections sit
-    on top of each other (a duplicate the frame-level dedupe missed). Otherwise
-    the cost looks at the `k` closest-in-time pairs of detections (this also
-    covers groups whose time spans interleave): how much farther apart they are
+    with overlapping time spans never link. Otherwise the cost looks at the
+    `k` closest-in-time pairs of detections: how much farther apart they are
     than someone could plausibly travel in that gap, plus a torso-size mismatch
     and a small preference for short gaps.
     """
     fa, fb = a["frames"], b["frames"]
-    shared = np.intersect1d(fa, fb)
-    if len(shared):
-        if len(shared) > max_overlap:
-            return np.inf
-        for f in shared:
-            ia, ib = np.searchsorted(fa, f), np.searchsorted(fb, f)
-            d = np.linalg.norm(a["centers"][ia] - b["centers"][ib])
-            if not d / min(a["sizes"][ia], b["sizes"][ib]) < dup_dist:
-                return np.inf
-    # nearest `a` frame for each `b` frame, skipping shared frames
+    # Frame-level deduplication already removed duplicate skeletons. Joining
+    # simultaneous or interleaved tracks can combine two different people.
+    if fa[-1] >= fb[0] and fb[-1] >= fa[0]:
+        return np.inf
+    color = appearance_distance(a["appearance"], b["appearance"])
+    if color is not None and color > .6:
+        return np.inf
+    # Nearest `a` frame for each `b` frame.
     idx = np.searchsorted(fa, fb)
     left, right = np.maximum(idx - 1, 0), np.minimum(idx, len(fa) - 1)
     pick = np.where(np.abs(fb - fa[left]) <= np.abs(fa[right] - fb), left, right)
@@ -117,16 +257,26 @@ def _link_cost(a: dict, b: dict, fps: float, max_gap: int, max_overlap: int = 3,
     if gaps.min() > max_gap:
         return np.inf
     size = np.minimum(a["sizes"][pick[sel]], b["sizes"][sel])
+    if a["extents"] is not None and b["extents"] is not None:
+        extent = np.minimum(a["extents"][pick[sel]], b["extents"][sel])
+        size = np.where(np.isfinite(extent), np.maximum(size, extent * .25), size)
     dist = np.linalg.norm(a["centers"][pick[sel]] - b["centers"][sel], axis=1) / size
     if not np.isfinite(dist).any():
         return np.inf
     excess = float(np.nanmedian(np.maximum(0.0, dist - (0.5 + gaps / fps))))
     size_pen = abs(float(np.log(np.median(b["sizes"]) / np.median(a["sizes"]))))
-    return excess + size_pen + 0.1 * float(np.median(gaps)) / fps
+    if a["extents"] is not None and b["extents"] is not None:
+        ea, eb = a["extents"], b["extents"]
+        ea, eb = ea[np.isfinite(ea) & (ea > 0)], eb[np.isfinite(eb) & (eb > 0)]
+        if len(ea) and len(eb):
+            # A floor move can foreshorten the torso dramatically while the
+            # full-body diagonal still distinguishes foreground from audience.
+            size_pen = .2 * size_pen + abs(float(np.log(np.median(eb) / np.median(ea))))
+    return excess + size_pen + 0.1 * float(np.median(gaps)) / fps + (color or 0)
 
 
 def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
-                     stitch_cost: float = 1.0, fps: float = 30.0) -> list:
+                     stitch_cost: float = 1.0, fps: float = 30.0, appearances=None, boxes=None) -> list:
     """Greedily join tracklets that look like one person who dropped out and came back.
 
     `tracklets`: list of [(frame, detection_idx), ...]. Merges the cheapest
@@ -136,11 +286,14 @@ def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
     """
     import heapq
 
-    groups = {i: _make_group(occ, kps, [i]) for i, occ in enumerate(tracklets)}
+    groups = {i: _make_group(occ, kps, [i], appearances, boxes) for i, occ in enumerate(tracklets)}
     version = {i: 0 for i in groups}
     heap: list = []
 
     def push(x: int, y: int):
+        fx, fy = groups[x]["frames"], groups[y]["frames"]
+        if max(fx[0], fy[0]) - min(fx[-1], fy[-1]) > max_stitch_gap:   # too far apart in time
+            return
         c = _link_cost(groups[x], groups[y], fps, max_stitch_gap)
         if c <= stitch_cost:
             heapq.heappush(heap, (c, x, y, version[x], version[y]))
@@ -156,7 +309,7 @@ def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
         if x not in groups or y not in groups or version[x] != vx or version[y] != vy:
             continue
         a, b = groups.pop(x), groups.pop(y)
-        groups[next_id] = _make_group(a["occ"] + b["occ"], kps, a["members"] + b["members"])
+        groups[next_id] = _make_group(a["occ"] + b["occ"], kps, a["members"] + b["members"], appearances, boxes)
         version[next_id] = 0
         for other in list(groups):
             if other != next_id:
@@ -166,9 +319,9 @@ def stitch_tracklets(tracklets: list, kps: list, max_stitch_gap: int = 150,
 
 
 def stabilize(kps: list, max_cost: float = 2.0, max_gap: int = 10,
-              min_track_len: int = 15, dup_cost: float = 0.4, stitch: bool = True,
+              min_track_len: int = 15, dup_cost: float = 0.15, stitch: bool = True,
               max_stitch_gap: int = 150, stitch_cost: float = 1.0, fps: float = 30.0,
-              return_info: bool = False):
+              return_info: bool = False, source_ids: list | None = None, appearances=None, boxes=None):
     """Assign stable track ids.
 
     Returns (track_ids, n_tracks) where track_ids[f] is an int array aligned
@@ -180,20 +333,25 @@ def stabilize(kps: list, max_cost: float = 2.0, max_gap: int = 10,
     are discarded, so a fragment can be absorbed into a real person rather than
     lost. `return_info=True` adds a third value: {"raw": pre-stitch ids,
     "fragments": number of raw fragments in each final track}.
+
+    Explicit `source_ids` preserve an upstream tracker's identities. Optional
+    clothing `appearances` disambiguate overlapping people without rerunning
+    pose detection; pose-only files use the motion/geometry fallback.
     """
-    raw, n_raw = _track_frames(kps, max_cost, max_gap, dup_cost)
+    raw, n_raw = (_source_tracks(source_ids) if source_ids is not None else
+                  _track_frames(kps, max_cost, max_gap, dup_cost, appearances, boxes))
 
     occs: list[list[tuple[int, int]]] = [[] for _ in range(n_raw)]
     for f, a in enumerate(raw):
         for i, tid in enumerate(a):
             if tid >= 0:
                 occs[tid].append((f, i))
-    groups = (stitch_tracklets(occs, kps, max_stitch_gap, stitch_cost, fps)
-              if stitch else [[t] for t in range(n_raw)])
+    groups = (stitch_tracklets(occs, kps, max_stitch_gap, stitch_cost, fps, appearances, boxes)
+              if stitch and source_ids is None else [[t] for t in range(n_raw)])
 
     # Drop tracks that live only briefly (likely false detections).
     kept = [g for g in groups if sum(len(occs[t]) for t in g) >= min_track_len]
-    kept.sort(key=lambda g: (occs[g[0]][0][0], g[0]))
+    kept.sort(key=lambda g: min((occs[t][0][0], t) for t in g))
     remap = {t: n for n, g in enumerate(kept) for t in g}
     out = [np.array([remap.get(t, -1) for t in a], int) for a in raw]
     for f, a in enumerate(out):    # stitched duplicates sharing a frame: keep the better one
@@ -206,22 +364,26 @@ def stabilize(kps: list, max_cost: float = 2.0, max_gap: int = 10,
     return out, len(kept)
 
 
-def _track_frames(kps: list, max_cost: float, max_gap: int, dup_cost: float):
+def _track_frames(kps: list, max_cost: float, max_gap: int, dup_cost: float, appearances=None, boxes=None):
     """Frame-to-frame Hungarian tracking. Returns (raw ids per frame, n raw ids)."""
-    tracks: dict[int, dict] = {}   # id -> {"pose": last pose, "last": frame}
+    tracks: dict[int, dict] = {}
     next_id = 0
     out = []
     for f, frame in enumerate(kps):
         active = [tid for tid, s in tracks.items() if f - s["last"] <= max_gap]
-        keep = _dedupe(frame, dup_cost) if len(frame) else np.zeros(0, bool)
+        predictions = {tid: _prediction(tracks[tid], f) for tid in active}
+        centers = [_center(p) for p in frame]
+        sizes = [_size(p) for p in frame]
+        extents = [_box_size(boxes[f][i]) if boxes is not None else np.nan for i in range(len(frame))]
+        keep = (_dedupe(frame, dup_cost, appearances[f] if appearances is not None else None)
+                if len(frame) else np.zeros(0, bool))
         assigned = np.full(len(frame), -1, int)
         if keep.any() and active:
-            C = np.full((len(frame), len(active)), np.inf)
-            for i, p in enumerate(frame):
-                if not keep[i]:
-                    continue
-                for j, tid in enumerate(active):
-                    C[i, j] = _cost(tracks[tid]["pose"], p)
+            C = _association_matrix([predictions[tid] for tid in active], frame,
+                                    np.array(centers).reshape(-1, 2), np.array(sizes, float),
+                                    max_cost, appearances[f] if appearances is not None else None,
+                                    extents)
+            C[~keep] = np.inf
             Cf = np.where(np.isfinite(C) & (C <= max_cost), C, 1e6)
             r, c = linear_sum_assignment(Cf)
             for i, j in zip(r, c):
@@ -233,9 +395,36 @@ def _track_frames(kps: list, max_cost: float, max_gap: int, dup_cost: float):
             if assigned[i] < 0:
                 assigned[i] = next_id
                 next_id += 1
-            tracks[assigned[i]] = {"pose": frame[i], "last": f}
+            tid = assigned[i]
+            history = tracks[tid]["history"] if tid in tracks else []
+            history = (history + [(f, centers[i], sizes[i])])[-5:]
+            appearance = appearances[f][i] if appearances is not None else None
+            if tid in tracks and tracks[tid]["appearance"] is not None:
+                # Keep a clothing reference over time; one occluded frame must
+                # not replace it with the person standing in front.
+                appearance = combine_appearances([tracks[tid]["appearance"]] * 9 + [appearance])
+            extent_history = tracks[tid]["extents"] if tid in tracks else []
+            if np.isfinite(extents[i]) and extents[i] > 0:
+                extent_history = (extent_history + [extents[i]])[-5:]
+            tracks[tid] = {"pose": frame[i], "last": f, "history": history,
+                           "appearance": appearance, "extents": extent_history}
         out.append(assigned)
     return out, next_id
+
+
+def _source_tracks(source_ids: list) -> tuple[list, int]:
+    """Renumber persistent detector ids by first appearance, never by position."""
+    mapping = {}
+    out = []
+    for frame_ids in source_ids:
+        assigned = np.full(len(frame_ids), -1, int)
+        for i, tid in enumerate(frame_ids):
+            if tid >= 0:
+                if tid not in mapping:
+                    mapping[tid] = len(mapping)
+                assigned[i] = mapping[tid]
+        out.append(assigned)
+    return out, len(mapping)
 
 
 def merge_track_ids(kps: list, track_ids: list, groups) -> tuple[list, int]:
@@ -280,8 +469,55 @@ def to_dense(kps: list, track_ids: list, n_tracks: int) -> np.ndarray:
     return dense
 
 
-def stable_track_ids(det, merge_groups=None) -> tuple[list, int]:
-    """Final per-frame track ids for a loaded run: automatic stitching, then any manual merges.
+def _settings_digest(path, fps: float) -> str:
+    """Identifies one tracker output: JSONL + source video (baseline_stamp), fps and every
+    `stabilize` default, so changing a default can't serve stale cached tracks."""
+    defaults = {k: v.default for k, v in inspect.signature(stabilize).parameters.items()
+                if v.default is not inspect.Parameter.empty}
+    blob = json.dumps([baseline_stamp(path), round(fps, 6), sorted(defaults.items())], default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()
+
+
+def _tracks_cache_path(path):
+    from pathlib import Path
+    return Path(path).with_name(Path(path).stem + ".tracks.npz")
+
+
+def _read_tracks(path, digest):
+    cache = _tracks_cache_path(path)
+    if not cache.exists():
+        return None
+    try:
+        with np.load(cache) as z:
+            if str(z["digest"]) != digest:
+                return None
+            cuts = np.cumsum(z["counts"])[:-1]
+            ids = np.split(z["ids"], cuts) if len(z["counts"]) else []
+            raw = np.split(z["raw"], cuts) if len(z["counts"]) else []
+            return ids, int(z["n"]), {"raw": raw, "fragments": z["fragments"].tolist()}
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _write_tracks(path, digest, ids, n, info):
+    cache = _tracks_cache_path(path)
+    tmp = cache.with_name(cache.name + ".tmp.npz")
+    try:
+        np.savez(tmp, digest=np.array(digest), n=n, counts=np.array([len(a) for a in ids], int),
+                 ids=np.concatenate(ids) if ids else np.zeros(0, int),
+                 raw=np.concatenate(info["raw"]) if ids else np.zeros(0, int),
+                 fragments=np.array(info["fragments"], int))
+        tmp.replace(cache)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def stable_track_ids(det, merge_groups=None, return_info: bool = False):
+    """Final track ids: automatic stitching, frozen learned joins, then manual corrections.
+
+    `merge_groups` is the saved manual correction: legacy merge groups, or an identity
+    edit log (merge/split/swap/remove, see `ddc.identity`). With `return_info`,
+    info["base"] holds the ids those corrections were applied to.
 
     This is the one place that defines "who is person N" for a run.  The Find people
     list, the composite analysis and the dancer-filtering features must all use it, or
@@ -289,8 +525,44 @@ def stable_track_ids(det, merge_groups=None) -> tuple[list, int]:
     """
     t = det.t
     fps = float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
-    ids, n = stabilize(det.kps, fps=fps)
-    groups = [sorted(set(g)) for g in (merge_groups or []) if len(set(g)) > 1]
-    if groups:
-        ids, n = merge_track_ids(det.kps, ids, groups)
-    return ids, n
+    source_ids = det.ids if getattr(det, "ids_persistent", False) else None
+    path = getattr(det, "path", None)
+    key = (str(path), _settings_digest(path, fps)) if path is not None else None
+    if key is not None and key in _TRACK_CACHE:
+        _TRACK_CACHE.move_to_end(key)
+        ids, n, info = _TRACK_CACHE[key]
+    else:
+        hit = _read_tracks(path, key[1]) if key is not None else None
+        if hit is None:
+            appearances = load_appearances(det) if source_ids is None else None
+            hit = stabilize(det.kps, fps=fps, source_ids=source_ids, appearances=appearances,
+                            boxes=det.bbox, return_info=True)
+            if key is not None:
+                _write_tracks(path, key[1], *hit)
+        ids, n, info = hit
+        if key is not None:
+            _TRACK_CACHE[key] = (ids, n, info)
+            while len(_TRACK_CACHE) > 8:
+                _TRACK_CACHE.popitem(last=False)
+    ids = [a.copy() for a in ids]
+    info = {"raw": [a.copy() for a in info["raw"]], "fragments": list(info["fragments"])}
+    from .identity import apply_edits, fragments_after, is_edit_log
+    from .identity_learning import prediction_groups
+    learned = prediction_groups(path) if path is not None else []
+    for stage, value in (("learned", learned), ("manual", merge_groups)):
+        if stage == "manual":
+            info["base"] = [a.copy() for a in ids]   # what the user's corrections apply to
+            if is_edit_log(value):
+                ids, n = apply_edits(det.kps, ids, value)
+                info["fragments"] = fragments_after(info["fragments"], info["base"], ids, n)
+                continue
+        groups = [sorted(set(g)) for g in (value or []) if len(set(g)) > 1]
+        if groups:
+            ids, n = merge_track_ids(det.kps, ids, groups)
+            target = {i: i for i in range(len(info["fragments"]))}
+            for group in groups:
+                for tid in group:
+                    target[tid] = group[0]
+            info["fragments"] = [sum(info["fragments"][t] for t in target if target[t] == k)
+                                 for k in sorted(set(target.values()))]
+    return (ids, n, info) if return_info else (ids, n)

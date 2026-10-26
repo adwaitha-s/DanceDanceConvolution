@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from ddc.tracking import merge_track_ids, stabilize
-from test_ddc import base_pose, place
+from ddc.tracking import merge_track_ids, stabilize, stitch_tracklets, to_dense
+from test_ddc import _write_jsonl_run, base_pose, place
 
 
 def _frames(spec, n_frames):
@@ -71,6 +71,137 @@ def test_dropped_duplicate_detection_is_not_a_phantom_person():
     kps = [np.stack([place(base_pose(), 300, 300, 40)] * 2) for _ in range(40)]
     _, n = stabilize(kps)
     assert n == 1
+
+
+def test_crossing_dancers_keep_identity_after_one_is_occluded():
+    # Identical poses, changing detection order, and one indistinguishable
+    # detection at the crossing: identity must follow motion, not screen side.
+    kps = []
+    for f in range(41):
+        people = [place(base_pose(), 100 + 10 * f, 300, 40),
+                  place(base_pose(), 500 - 10 * f, 300, 40)]
+        kps.append(np.stack(people if f % 2 == 0 else people[::-1]))
+    ids, n = stabilize(kps)
+    assert n == 2
+    dense = to_dense(kps, ids, n)
+    for tid, direction in ((0, 1), (1, -1)):
+        xs = dense[:, tid, 0, 0]
+        visible = np.isfinite(xs)
+        np.testing.assert_allclose(xs[visible], (100 if tid == 0 else 500)
+                                   + direction * 10 * np.arange(41)[visible])
+
+
+def test_moving_dancer_returns_to_own_track_after_dropout():
+    kps = []
+    for f in range(40):
+        people = [place(base_pose(), 100 + 10 * f, 300, 40)] if not 17 <= f < 23 else []
+        people.append(place(base_pose(), 300, 300, 40))
+        kps.append(np.stack(people))
+    ids, n = stabilize(kps)
+    assert n == 2
+    assert ids[0].tolist() == ids[-1].tolist() == [0, 1]
+    assert all(ids[f].tolist() == [1] for f in range(17, 23))
+
+
+def test_close_distinct_dancers_are_not_discarded_as_duplicates():
+    kps = _frames([(300, 0, 0, 40), (310, 0, 0, 40)], 40)
+    ids, n = stabilize(kps)
+    assert n == 2
+    assert all(a.tolist() == [0, 1] for a in ids)
+
+
+@pytest.mark.parametrize("supplied_video", [False, True])
+def test_saved_video_clothing_prevents_identity_swap_at_ambiguous_positions(tmp_path, supplied_video):
+    import cv2
+    from ddc.analyze import analyze_run, detect_tracks
+    from ddc.io import load_jsonl
+    from ddc.tracking import stable_track_ids
+
+    frames = [[place(base_pose(), x, 200, 40) for x in
+               ([100, 130] if f < 20 else [130, 100])] for f in range(40)]
+    run = _write_jsonl_run(tmp_path, frames)
+    video = tmp_path / "clip.mp4" if supplied_video else run / "source.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 30, (320, 400))
+    assert writer.isOpened()
+    try:
+        for poses in frames:
+            image = np.zeros((400, 320, 3), np.uint8)
+            for p, color in zip(poses, [(0, 0, 255), (255, 0, 0)]):
+                x = int(p[0, 0])
+                cv2.rectangle(image, (x - 14, 158), (x + 14, 201), color, -1)
+                for offset in (-12, 12):
+                    cv2.line(image, (x + offset, 200), (x + offset, 260), color, 10)
+            writer.write(image)
+    finally:
+        writer.release()
+    if supplied_video:
+        assert len(detect_tracks(run, video_path=video)) == 2
+        assert analyze_run(run, render=False).dense[-1, 0, 0, 0] == 130
+    det = load_jsonl(run / "tracking.jsonl")
+    ids, n = stable_track_ids(det)
+    assert n == 2
+    assert all(a.tolist() == [0, 1] for a in ids)
+    # A merged view must not mutate the cached automatic assignments.
+    merged, n = stable_track_ids(det, [[0, 1]])
+    assert n == 1
+    ids, n = stable_track_ids(det)
+    assert n == 2 and ids[-1].tolist() == [0, 1]
+
+
+def test_stitching_does_not_combine_people_seen_together_briefly():
+    kps = _frames([(300, 0, 0, 21), (305, 0, 20, 40)], 40)
+    first = [(f, 0) for f in range(21)]
+    second = [(f, 1 if f == 20 else 0) for f in range(20, 40)]
+    assert stitch_tracklets([first, second], kps) == [[0], [1]]
+
+
+def test_floor_move_foreshortening_does_not_create_a_new_person():
+    from ddc.skeleton import J
+    standing = place(base_pose(), 300, 300, 40)
+    floor = standing.copy()
+    floor[:, :2] = (floor[:, :2] - [300, 300]) @ np.array([[0, 1], [-1, 0]]) + [325, 300]
+    # Projected shoulders overlap the hips while the rest of the body remains visible.
+    floor[[J["left_shoulder"], J["right_shoulder"]], :2] = floor[[J["left_hip"], J["right_hip"]], :2]
+    kps = [standing[None]] * 40 + [np.zeros((0, 17, 3))] * 20 + [floor[None]] * 40
+    boxes = [[[*p[:, :2].min(0), *p[:, :2].max(0)] for p in frame] for frame in kps]
+    ids, n = stabilize(kps, boxes=boxes)
+    assert n == 1
+    assert ids[0].tolist() == ids[-1].tolist() == [0]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_loaded_ids_are_trusted_only_when_explicitly_persistent(tmp_path, persistent):
+    import json
+    from ddc.analyze import analyze_run, detect_tracks
+    from ddc.io import load_jsonl
+    from ddc.skeleton import BODY
+    from ddc.tracking import stable_track_ids
+
+    records = []
+    for f in range(40):
+        # Persistent ids survive a long absence and a large move. Detection
+        # indices at the same location still need frame-to-frame association.
+        xs = [100, 500] if f < 20 or not persistent else [500, 100]
+        people = [{"id": tid, "keypoints": dict(zip(BODY, place(base_pose(), x, 300, 40).tolist()))}
+                  for tid, x in zip([23, 71], xs)]
+        if f % 2:
+            people.reverse()
+        if persistent and 5 <= f < 20:
+            people = []
+        record = {"t": f / 30, "people": people}
+        if persistent:
+            record["id_type"] = "track"
+        records.append(record)
+    (tmp_path / "tracking.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+    det = load_jsonl(tmp_path / "tracking.jsonl")
+    assert det.ids_persistent == persistent
+    ids, n = stable_track_ids(det)
+    assert n == 2
+    assert ids[0].tolist() == [0, 1]
+    assert ids[-1].tolist() == [1, 0]
+    assert len(detect_tracks(tmp_path)) == 2
+    result = analyze_run(tmp_path, render=False)
+    assert result.dense[-1, 0, 0, 0] == (500 if persistent else 100)
 
 
 def test_merge_track_ids_combines_and_renumbers():

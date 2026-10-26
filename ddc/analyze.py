@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
 from .reference import reference_from_solo, reference_from_track
 from .skeleton import BODY
-from .tracking import merge_track_ids, stabilize, to_dense
+from .tracking import stable_track_ids, to_dense
 
 
 @dataclass
@@ -78,6 +79,11 @@ def _pick_background(run_dir: Path, video_path) -> tuple[Path | None, float]:
     return (overlay, 0.3) if overlay.exists() else (None, 1.0)
 
 
+# Thumbnails by (background video stamp, frame, bbox): identity edits re-list everyone,
+# but only the people an edit changed need a new crop.
+_THUMBS: OrderedDict = OrderedDict()
+
+
 def _crop_thumbnail(cap: cv2.VideoCapture | None, frame_idx: int, bbox, pad: float = 0.3,
                     size: int = 200) -> np.ndarray:
     blank = np.full((size, size, 3), 40, np.uint8)
@@ -106,21 +112,6 @@ def _fps(t: np.ndarray) -> float:
     return float((len(t) - 1) / (t[-1] - t[0])) if len(t) > 1 and t[-1] > t[0] else 30.0
 
 
-def _apply_merges(kps, ids, fragments, merge_groups):
-    """Manual merges on top of the automatic stitching. Returns (ids, n, fragments per track)."""
-    if not merge_groups:
-        return ids, len(fragments), fragments
-    groups = [sorted(set(g)) for g in merge_groups if len(g) > 1]
-    ids, n = merge_track_ids(kps, ids, groups)
-    target = {t: t for t in range(len(fragments))}
-    for g in groups:
-        for t in g:
-            target[t] = g[0]
-    kept = sorted(set(target.values()))
-    merged = [sum(fragments[t] for t in target if target[t] == k) for k in kept]
-    return ids, n, merged
-
-
 def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo]:
     """Stabilize tracks and return one thumbnail + summary per track.
 
@@ -134,14 +125,15 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
     ids/labels are then for the merged view.
     """
     run_dir = Path(run_dir)
+    if video_path:
+        _save_source_video(run_dir, video_path)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    fps = _fps(det.t)
-    ids, n_tracks, info = stabilize(det.kps, fps=fps, return_info=True)
+    ids, n_tracks, info = stable_track_ids(det, merge_groups, return_info=True)
     if n_tracks == 0:
         raise ValueError("no persistent people found (all detections were short-lived)")
-    ids, n_tracks, fragments = _apply_merges(det.kps, ids, info["fragments"], merge_groups)
+    fragments = info["fragments"]
 
     occurrences: list[list[tuple[int, int]]] = [[] for _ in range(n_tracks)]
     for f, a in enumerate(ids):
@@ -150,13 +142,24 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
                 occurrences[tid].append((f, i))
 
     bg_path, _ = _pick_background(run_dir, video_path)
-    cap = cv2.VideoCapture(str(bg_path)) if bg_path else None
+    bg_stamp = (str(bg_path), Path(bg_path).stat().st_mtime_ns) if bg_path else None
+    cap = None
     tracks = []
     for tid, occ in enumerate(occurrences):
         fs = [f for f, _ in occ]
         t_start, t_end = float(det.t[fs[0]]), float(det.t[fs[-1]])
-        best_f, best_i = max(occ, key=lambda fi: det.raw[fi[0]][fi[1]].get("conf", 0.0))
-        thumb = _crop_thumbnail(cap, best_f, det.raw[best_f][best_i].get("bbox"))
+        best_f, best_i = max(occ, key=lambda fi: det.conf[fi[0]][fi[1]])
+        box = det.bbox[best_f][best_i]
+        bbox = box.tolist() if np.isfinite(box).all() else None
+        key = (bg_stamp, best_f, tuple(bbox) if bbox else None)
+        thumb = _THUMBS.get(key)
+        if thumb is None:            # seeking a long source video takes ~1 s per thumbnail
+            if cap is None and bg_path:
+                cap = cv2.VideoCapture(str(bg_path))
+            thumb = _crop_thumbnail(cap, best_f, bbox)
+            _THUMBS[key] = thumb
+            while len(_THUMBS) > 512:
+                _THUMBS.popitem(last=False)
         joined = f", {fragments[tid]} fragments joined" if fragments[tid] > 1 else ""
         segments, s = [], 0
         for k in range(1, len(fs) + 1):
@@ -237,14 +240,14 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"unknown reference_mode {reference_mode!r}")
     run_dir = Path(run_dir)
+    if video_path:
+        _save_source_video(run_dir, video_path)
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks = stabilize(det.kps, fps=_fps(det.t))
+    ids, n_tracks = stable_track_ids(det, merge_groups)
     if n_tracks == 0:
         raise ValueError("no persistent dancers found (all detections were short-lived)")
-    if merge_groups:
-        ids, n_tracks = merge_track_ids(det.kps, ids, merge_groups)
     dense = to_dense(det.kps, ids, n_tracks)
     if selected_tracks is not None:
         if not selected_tracks:
