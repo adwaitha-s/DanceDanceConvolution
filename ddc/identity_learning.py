@@ -112,13 +112,18 @@ def _fps(det):
     return float((len(det.t) - 1) / (det.t[-1] - det.t[0])) if len(det.t) > 1 and det.t[-1] > det.t[0] else 30.
 
 
-def _examples(groups, merges, fps):
-    identity = {i: i for i in range(len(groups))}
-    for merged in merges:
-        for tid in merged:
-            identity[tid] = min(merged)
+def _examples(groups, merges, fps, identity=None):
+    """`identity` (track -> person, None for a track the user's edits split across people)
+    overrides `merges`; tracks without one identity are left out of every pair."""
+    if identity is None:
+        identity = {i: i for i in range(len(groups))}
+        for merged in merges:
+            for tid in merged:
+                identity[tid] = min(merged)
     samples = []
     for i, j in combinations(range(len(groups)), 2):
+        if identity.get(i) is None or identity.get(j) is None:
+            continue
         same = identity[i] == identity[j]
         # Untouched, disjoint fragments are unknown, never invented negatives.
         if not same and not _simultaneous(groups[i], groups[j]):
@@ -182,14 +187,16 @@ def train_model(runs_dir):
 def save_merge_review(run_dir, merges):
     """Save the identities shown in Dancers and refit without changing that run's ids."""
     from .io import load_jsonl
-    from .tracking import merge_track_ids, stable_track_ids, tracking_stamp
+    from .feature_inventory import normalize_merges
+    from .identity import apply_identity, track_identity
+    from .tracking import stable_track_ids, tracking_stamp
     run_dir = Path(run_dir)
     det = load_jsonl(run_dir / "tracking.jsonl")
     ids, count = stable_track_ids(det)
     # Validate before writing anything, including repeated membership and unknown ids.
-    merge_track_ids(det.kps, ids, merges)
-    merges = sorted(sorted(set(g)) for g in (merges or []) if len(set(g)) > 1)
-    examples = _examples(_track_groups(det, ids, count), merges, _fps(det))
+    final, _ = apply_identity(det.kps, ids, merges)
+    merges = normalize_merges(merges)
+    examples = _examples(_track_groups(det, ids, count), [], _fps(det), track_identity(ids, final))
     saved = {"version": VERSION, "tracking_stamp": tracking_stamp(det.path),
              "groups": merges, "examples": examples}
     with FileLock(str(run_dir.parent / ".identity-learning.lock"), timeout=30):

@@ -27,6 +27,7 @@ from ddc.analyze import _save_source_video, analyze_run, detect_tracks
 from ddc.coaching import SCORE_EXPLANATION, feedback_moments, joint_feedback, key_moments
 from ddc.overlay_cache import render_dancer_overlay
 from ddc.feature_registry import validate_checklist, load_merges, review_is_current
+from ddc import identity
 from ddc.dancer_features import load_labels
 from ddc.identity_learning import initialize_predictions, save_merge_review
 from ddc.io import load_jsonl
@@ -192,16 +193,6 @@ def run_analysis(video_path: str, model_choice: str, track: bool, num_people: in
 _LAST: dict = {}
 
 
-def _members(n_auto: int, groups: list[list[int]]) -> list[list[int]]:
-    """Automatic track ids behind each displayed person, in display order (matches the
-    renumbering in ddc.tracking.merge_track_ids: merged people sort by lowest member)."""
-    target = {t: t for t in range(n_auto)}
-    for g in groups:
-        for t in g:
-            target[t] = min(g)
-    return [[t for t in range(n_auto) if target[t] == k] for k in sorted(set(target.values()))]
-
-
 def _predict_people(run_name, groups, tracks):
     """Score the people currently shown and pick the predicted dancers.
 
@@ -302,11 +293,12 @@ def _show_people(run_name, groups, progress=None):
             gr.update(choices=labels, value=[]), tracks_figure(tracks),
             gr.update(value=None, visible=False), note, headline,  # preview is on demand
             _review_status(selected), gr.update(interactive=True),
-            ("Saved merges restored. Save again after making changes."
+            ("Saved corrections restored. Save again after making changes."
              if groups and load_merges(folder) == groups else
-             "Unsaved merge changes — click Save merges to use them in future analyses."
+             f"Unsaved: {_describe_history()} — click Save corrections to keep them. "
+             "Undo removes the last change."
              if groups or load_merges(folder) else
-             "Merge duplicate people, then save to teach future analyses."))
+             "Fix who's who below, then save to teach future analyses."))
 
 
 N_PEOPLE_OUTPUTS = 11   # length of the tuple _show_people returns
@@ -329,6 +321,51 @@ def begin_review(run_name):
             gr.update(value=None, visible=False))
 
 
+def _describe_history() -> str:
+    names = {"merge": "merge", "split": "split", "swap": "swap", "remove": "removal"}
+    edits = _LAST.get("history", [])
+    if not edits:
+        return "all corrections reset"
+    counts: dict[str, int] = {}
+    for e in edits:
+        counts[e["op"]] = counts.get(e["op"], 0) + 1
+    return ", ".join(f"{n} {names[op]}{'s' if n > 1 else ''}" for op, n in counts.items())
+
+
+def _show_history(run_name, history, progress=None):
+    """Show the people after replaying `history`, the user's ordered identity edits."""
+    previous = _LAST.get("history", [])
+    _LAST["history"] = list(history)          # the status line describes it
+    try:
+        return _show_people(run_name, identity.canonical(history, _LAST["n_auto"]), progress)
+    except Exception:
+        _LAST["history"] = previous           # a rejected edit leaves the old state in place
+        raise
+
+
+def _picked(labels, choice, n: int | None, what: str) -> list[int]:
+    """Displayed person indices for the ticked boxes; `n` = how many must be ticked."""
+    picked = sorted(labels.index(c) for c in (choice or []))
+    if n is not None and len(picked) != n:
+        raise gr.Error(f"Tick exactly {n} {'person' if n == 1 else 'people'} to {what}.")
+    return picked
+
+
+def _frame_at(seconds) -> int:
+    if seconds is None:
+        raise gr.Error("Enter a time in seconds.")
+    t = _LAST["t"]
+    return int(min(np.searchsorted(t, float(seconds) - 1e-6), len(t) - 1))
+
+
+def _edit(run_name, edit, progress):
+    _require_people(run_name)
+    try:
+        return _show_history(run_name, _LAST.get("history", []) + [edit], progress)
+    except ValueError as e:
+        raise gr.Error(str(e))
+
+
 @_friendly("Finding people")
 def run_detect(run_name, progress=gr.Progress()):
     """Find every stabilized person track in the run and show a thumbnail
@@ -343,8 +380,10 @@ def run_detect(run_name, progress=gr.Progress()):
     progress(0.1, desc="Finding people in the clip...")
     _LAST.clear()
     folder = RUNS_DIR / run_name
-    _, _LAST["n_auto"] = stable_track_ids(load_jsonl(folder / "tracking.jsonl"))
-    return _show_people(run_name, load_merges(folder), progress)
+    det = load_jsonl(folder / "tracking.jsonl")
+    _, _LAST["n_auto"] = stable_track_ids(det)
+    _LAST["t"] = det.t
+    return _show_history(run_name, identity.from_saved(load_merges(folder)), progress)
 
 
 def _require_people(run_name):
@@ -356,38 +395,75 @@ def _require_people(run_name):
 
 @_friendly("Merging")
 def run_merge(run_name, merge_choice, progress=gr.Progress()):
-    """Treat the ticked people as one person (adds to any earlier merges)."""
+    """Treat the ticked people as one person (adds to any earlier corrections)."""
     labels = _require_people(run_name)
-    if len(merge_choice or []) < 2:
+    picked = _picked(labels, merge_choice, None, "merge")
+    if len(picked) < 2:
         raise gr.Error("Tick at least two people to merge.")
     progress(0.1, desc="Merging...")
-    members = _members(_LAST["n_auto"], _LAST.get("merges", []))
-    picked = sorted(labels.index(c) for c in merge_choice)
-    joined = sorted(t for i in picked for t in members[i])
-    groups = [m for i, m in enumerate(members) if len(m) > 1 and i not in picked] + [joined]
-    return _show_people(run_name, groups, progress)
+    return _edit(run_name, {"op": "merge", "groups": [picked]}, progress)
 
 
-@_friendly("Resetting merges")
+@_friendly("Splitting")
+def run_split(run_name, merge_choice, t_from, progress=gr.Progress()):
+    """From `t_from` on, the ticked person becomes a new person (e.g. after an ID swap)."""
+    labels = _require_people(run_name)
+    (person,) = _picked(labels, merge_choice, 1, "split")
+    progress(0.1, desc="Splitting...")
+    return _edit(run_name, {"op": "split", "person": person, "frame": _frame_at(t_from)}, progress)
+
+
+@_friendly("Swapping")
+def run_swap(run_name, merge_choice, t_from, t_to, progress=gr.Progress()):
+    """Exchange the two ticked people between `t_from` and `t_to` (tracker swapped them)."""
+    labels = _require_people(run_name)
+    people = _picked(labels, merge_choice, 2, "swap")
+    progress(0.1, desc="Swapping...")
+    return _edit(run_name, {"op": "swap", "people": people,
+                            "frames": [_frame_at(t_from), _frame_at(t_to)]}, progress)
+
+
+@_friendly("Removing")
+def run_remove(run_name, merge_choice, t_from, t_to, progress=gr.Progress()):
+    """Drop the ticked person's detections between `t_from` and `t_to` (someone else
+    picked up under their number, e.g. a passer-by in front of them)."""
+    labels = _require_people(run_name)
+    (person,) = _picked(labels, merge_choice, 1, "remove")
+    progress(0.1, desc="Removing...")
+    return _edit(run_name, {"op": "remove", "person": person,
+                            "frames": [_frame_at(t_from), _frame_at(t_to)]}, progress)
+
+
+@_friendly("Undoing")
+def run_undo(run_name, progress=gr.Progress()):
+    _require_people(run_name)
+    history = _LAST.get("history", [])
+    if not history:
+        raise gr.Error("Nothing to undo.")
+    progress(0.1, desc="Undoing...")
+    return _show_history(run_name, history[:-1], progress)
+
+
+@_friendly("Resetting corrections")
 def run_reset_merges(run_name, progress=gr.Progress()):
     _require_people(run_name)
-    progress(0.1, desc="Resetting merges...")
-    return _show_people(run_name, [], progress)
+    progress(0.1, desc="Resetting corrections...")
+    return _show_history(run_name, [], progress)
 
 
 @_friendly("Saving merges")
 def run_save_merges(run_name, progress=gr.Progress()):
     _require_people(run_name)
-    progress(.2, desc="Saving merges and learning track identities...")
+    progress(.2, desc="Saving corrections and learning track identities...")
     report = save_merge_review(RUNS_DIR / run_name, _LAST.get("merges", []))
-    progress(1, desc="Merges saved")
+    progress(1, desc="Corrections saved")
     if report["status"] == "training_failed":
-        return f"Merges saved. Identity model training needs attention: {report['error']}"
+        return f"Corrections saved. Identity model training needs attention: {report['error']}"
     counts = f"{report['positive_pairs']} same-person and {report['negative_pairs']} different-person examples."
     if report["status"] == "ready":
-        return ("✅ Merges saved. Identity model updated for future analyses using " + counts
+        return ("✅ Corrections saved. Identity model updated for future analyses using " + counts
                 + " Review dancer labels again if the merges changed.")
-    return ("✅ Merges saved. Collected " + counts
+    return ("✅ Corrections saved. Collected " + counts
             + " Learning needs both a merged pair and separate people visible together."
             + " Review dancer labels again if the merges changed.")
 
@@ -396,7 +472,8 @@ def run_save_merges(run_name, progress=gr.Progress()):
 def refresh_saved_merges(run_name, save_message, progress=gr.Progress()):
     """Re-score the saved merged identities and retain the merge-learning result."""
     _require_people(run_name)
-    shown = list(_show_people(run_name, load_merges(RUNS_DIR / run_name), progress))
+    shown = list(_show_history(run_name, identity.from_saved(load_merges(RUNS_DIR / run_name)),
+                               progress))
     shown[-1] = save_message
     return shown
 
@@ -806,18 +883,35 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     people_headline = gr.Markdown()
                     people_gallery = gr.Gallery(label="Detected people", columns=4, height=220,
                                                 object_fit="contain")
-                    with gr.Accordion("Same person listed twice? Merge", open=False):
+                    with gr.Accordion("Fix who's who: merge, split, swap", open=False):
                         gr.Markdown("Fragments are joined automatically when the tracker lost "
-                                    "someone and found them again. If the same person still "
-                                    "appears more than once, tick them here and merge. Merging "
-                                    "renumbers people, so the dancer predictions are recomputed. "
-                                    "Save merges to remember the correction and teach future analyses. "
-                                    "To undo saved merges, reset and save again.")
-                        merge_select = gr.CheckboxGroup(label="People to merge into one", choices=[])
+                                    "someone and found them again. Fix what it got wrong:\n"
+                                    "- **Merge**: tick the same person listed more than once.\n"
+                                    "- **Split from**: tick one person whose track turns into "
+                                    "someone else at that time; from then on they're a new person.\n"
+                                    "- **Swap**: tick two people the tracker swapped between "
+                                    "*From* and *To*.\n"
+                                    "- **Remove**: tick one person to drop their detections "
+                                    "between *From* and *To*.\n\n"
+                                    "Merges renumber people; splits add the new person at the end. "
+                                    "Undo steps back one change. Save corrections to keep them "
+                                    "and teach future analyses. Use the timeline on the right to "
+                                    "find times.")
+                        merge_select = gr.CheckboxGroup(label="People to fix", choices=[])
                         with gr.Row():
-                            merge_btn = gr.Button("Merge selected", size="sm")
-                            reset_merge_btn = gr.Button("Reset merges", size="sm")
-                            save_merge_btn = gr.Button("Save merges", size="sm", variant="primary")
+                            fix_from = gr.Number(label="From (s)", value=None, minimum=0,
+                                                 min_width=90)
+                            fix_to = gr.Number(label="To (s)", value=None, minimum=0, min_width=90)
+                        with gr.Row():
+                            merge_btn = gr.Button("Merge", size="sm")
+                            split_btn = gr.Button("Split from", size="sm")
+                            swap_btn = gr.Button("Swap", size="sm")
+                            remove_btn = gr.Button("Remove", size="sm")
+                        with gr.Row():
+                            undo_btn = gr.Button("Undo", size="sm")
+                            reset_merge_btn = gr.Button("Reset all", size="sm")
+                            save_merge_btn = gr.Button("Save corrections", size="sm",
+                                                       variant="primary")
                         merge_status = gr.Markdown()
                     track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
                     with gr.Row():
@@ -963,6 +1057,14 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     show_progress_on=people_gallery)
     reset_merge_btn.click(run_reset_merges, inputs=active_run, outputs=people_outputs,
                           show_progress_on=people_gallery)
+    split_btn.click(run_split, inputs=[active_run, merge_select, fix_from], outputs=people_outputs,
+                    show_progress_on=people_gallery)
+    swap_btn.click(run_swap, inputs=[active_run, merge_select, fix_from, fix_to],
+                   outputs=people_outputs, show_progress_on=people_gallery)
+    remove_btn.click(run_remove, inputs=[active_run, merge_select, fix_from, fix_to],
+                     outputs=people_outputs, show_progress_on=people_gallery)
+    undo_btn.click(run_undo, inputs=active_run, outputs=people_outputs,
+                   show_progress_on=people_gallery)
     save_merge_btn.click(run_save_merges, inputs=active_run, outputs=merge_status,
                          show_progress_on=merge_status
     ).success(refresh_saved_merges, inputs=[active_run, merge_status], outputs=people_outputs,

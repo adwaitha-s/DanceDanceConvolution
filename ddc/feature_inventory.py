@@ -310,8 +310,12 @@ def _frame_values(poses: np.ndarray, scales: np.ndarray) -> dict[str, np.ndarray
     return values
 
 
-def normalize_merges(merge_groups) -> list[list[int]]:
-    """Canonical form (sorted, de-duplicated groups of 2+) so merge lists can be compared."""
+def normalize_merges(merge_groups) -> list:
+    """Canonical form so saved identity corrections can be compared: sorted, de-duplicated
+    merge groups of 2+, or (for runs that used split/swap/remove) the cleaned edit log."""
+    from .identity import from_saved, is_edit_log
+    if is_edit_log(merge_groups):
+        return from_saved(merge_groups)
     return sorted(sorted({int(t) for t in g}) for g in (merge_groups or []) if len({int(t) for t in g}) > 1)
 
 

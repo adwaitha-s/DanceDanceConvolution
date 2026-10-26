@@ -69,8 +69,23 @@ run retains its person numbers. Saved merges are also recorded in
 when tracking inputs or person numbers change.
 
 Identity matching can still split or mix people after long occlusions.
-Review and save merges in the GUI when the people list is wrong. Saving a
-merge does not label anyone as a dancer.
+Fix the people list under **Fix who's who** in step 2, then **Save
+corrections**. Saving corrections does not label anyone as a dancer.
+
+- **Merge**: tick the same person listed more than once.
+- **Split from**: tick one person and enter *From (s)*; from that time on
+  their detections become a new person (added at the end of the list).
+- **Swap**: tick two people the tracker swapped, with *From* and *To*.
+- **Remove**: tick one person to drop their detections between *From* and *To*.
+- **Undo** steps back one change; **Reset all** clears them.
+
+Corrections are an ordered edit log (`ddc/identity.py`): each edit refers to
+people as numbered on screen when it was made, so replaying the log always
+reproduces the same list. A log of only merges is saved in the original
+merge-groups form, so `merges.json` from earlier versions still loads; runs
+that use split/swap/remove save the edit list instead. Identity learning
+skips any track an edit split across people, since it no longer belongs to
+one person.
 
 ## Fifteen validated training videos
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +79,11 @@ def _pick_background(run_dir: Path, video_path) -> tuple[Path | None, float]:
     return (overlay, 0.3) if overlay.exists() else (None, 1.0)
 
 
+# Thumbnails by (background video stamp, frame, bbox): identity edits re-list everyone,
+# but only the people an edit changed need a new crop.
+_THUMBS: OrderedDict = OrderedDict()
+
+
 def _crop_thumbnail(cap: cv2.VideoCapture | None, frame_idx: int, bbox, pad: float = 0.3,
                     size: int = 200) -> np.ndarray:
     blank = np.full((size, size, 3), 40, np.uint8)
@@ -136,14 +142,24 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
                 occurrences[tid].append((f, i))
 
     bg_path, _ = _pick_background(run_dir, video_path)
-    cap = cv2.VideoCapture(str(bg_path)) if bg_path else None
+    bg_stamp = (str(bg_path), Path(bg_path).stat().st_mtime_ns) if bg_path else None
+    cap = None
     tracks = []
     for tid, occ in enumerate(occurrences):
         fs = [f for f, _ in occ]
         t_start, t_end = float(det.t[fs[0]]), float(det.t[fs[-1]])
         best_f, best_i = max(occ, key=lambda fi: det.conf[fi[0]][fi[1]])
         box = det.bbox[best_f][best_i]
-        thumb = _crop_thumbnail(cap, best_f, box.tolist() if np.isfinite(box).all() else None)
+        bbox = box.tolist() if np.isfinite(box).all() else None
+        key = (bg_stamp, best_f, tuple(bbox) if bbox else None)
+        thumb = _THUMBS.get(key)
+        if thumb is None:            # seeking a long source video takes ~1 s per thumbnail
+            if cap is None and bg_path:
+                cap = cv2.VideoCapture(str(bg_path))
+            thumb = _crop_thumbnail(cap, best_f, bbox)
+            _THUMBS[key] = thumb
+            while len(_THUMBS) > 512:
+                _THUMBS.popitem(last=False)
         joined = f", {fragments[tid]} fragments joined" if fragments[tid] > 1 else ""
         segments, s = [], 0
         for k in range(1, len(fs) + 1):

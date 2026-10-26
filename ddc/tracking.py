@@ -513,7 +513,11 @@ def _write_tracks(path, digest, ids, n, info):
 
 
 def stable_track_ids(det, merge_groups=None, return_info: bool = False):
-    """Final track ids: automatic stitching, frozen learned joins, then manual merges.
+    """Final track ids: automatic stitching, frozen learned joins, then manual corrections.
+
+    `merge_groups` is the saved manual correction: legacy merge groups, or an identity
+    edit log (merge/split/swap/remove, see `ddc.identity`). With `return_info`,
+    info["base"] holds the ids those corrections were applied to.
 
     This is the one place that defines "who is person N" for a run.  The Find people
     list, the composite analysis and the dancer-filtering features must all use it, or
@@ -542,10 +546,17 @@ def stable_track_ids(det, merge_groups=None, return_info: bool = False):
                 _TRACK_CACHE.popitem(last=False)
     ids = [a.copy() for a in ids]
     info = {"raw": [a.copy() for a in info["raw"]], "fragments": list(info["fragments"])}
+    from .identity import apply_edits, fragments_after, is_edit_log
     from .identity_learning import prediction_groups
     learned = prediction_groups(path) if path is not None else []
-    for merge_stage in (learned, merge_groups):
-        groups = [sorted(set(g)) for g in (merge_stage or []) if len(set(g)) > 1]
+    for stage, value in (("learned", learned), ("manual", merge_groups)):
+        if stage == "manual":
+            info["base"] = [a.copy() for a in ids]   # what the user's corrections apply to
+            if is_edit_log(value):
+                ids, n = apply_edits(det.kps, ids, value)
+                info["fragments"] = fragments_after(info["fragments"], info["base"], ids, n)
+                continue
+        groups = [sorted(set(g)) for g in (value or []) if len(set(g)) > 1]
         if groups:
             ids, n = merge_track_ids(det.kps, ids, groups)
             target = {i: i for i in range(len(info["fragments"]))}
