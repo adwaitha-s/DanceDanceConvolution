@@ -20,7 +20,7 @@ from .deviation import Deviation, compute_deviation, worst_moments
 from .normalize import normalize
 from .reference import reference_from_solo, reference_from_track
 from .skeleton import BODY
-from .tracking import merge_track_ids, stabilize, to_dense
+from .tracking import cached_stabilize, merge_track_ids, to_dense
 
 
 @dataclass
@@ -137,8 +137,7 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    fps = _fps(det.t)
-    ids, n_tracks, info = stabilize(det.kps, fps=fps, return_info=True)
+    ids, n_tracks, info = cached_stabilize(det)
     if n_tracks == 0:
         raise ValueError("no persistent people found (all detections were short-lived)")
     ids, n_tracks, fragments = _apply_merges(det.kps, ids, info["fragments"], merge_groups)
@@ -155,8 +154,9 @@ def detect_tracks(run_dir, video_path=None, merge_groups=None) -> list[TrackInfo
     for tid, occ in enumerate(occurrences):
         fs = [f for f, _ in occ]
         t_start, t_end = float(det.t[fs[0]]), float(det.t[fs[-1]])
-        best_f, best_i = max(occ, key=lambda fi: det.raw[fi[0]][fi[1]].get("conf", 0.0))
-        thumb = _crop_thumbnail(cap, best_f, det.raw[best_f][best_i].get("bbox"))
+        best_f, best_i = max(occ, key=lambda fi: det.conf[fi[0]][fi[1]])
+        box = det.bbox[best_f][best_i]
+        thumb = _crop_thumbnail(cap, best_f, box.tolist() if np.isfinite(box).all() else None)
         joined = f", {fragments[tid]} fragments joined" if fragments[tid] > 1 else ""
         segments, s = [], 0
         for k in range(1, len(fs) + 1):
@@ -240,7 +240,7 @@ def analyze_run(run_dir, video_path=None, leave_one_out=None, rotate=False,
     det = ddc_io.load_jsonl(run_dir / "tracking.jsonl")
     if det.n_frames == 0:
         raise ValueError("tracking.jsonl is empty")
-    ids, n_tracks = stabilize(det.kps, fps=_fps(det.t))
+    ids, n_tracks, _ = cached_stabilize(det)
     if n_tracks == 0:
         raise ValueError("no persistent dancers found (all detections were short-lived)")
     if merge_groups:

@@ -7,19 +7,31 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .deviation import Deviation
+from .palette import dancer_color
 from .render import DEV_MAX
+from .smoothing import nan_moving_mean
 
-COLORS = ["#f5a03c", "#3cc8ff", "#a078ff", "#3cff9e", "#ff789e", "#c8c85a"]
+MAX_POINTS = 2000   # timeline samples sent to the browser; longer runs are binned
+
+
+def _bin(x: np.ndarray, stride: int) -> np.ndarray:
+    """Mean over consecutive bins of `stride` samples (NaN-aware) along axis 0."""
+    if stride <= 1:
+        return x
+    n = -(-len(x) // stride) * stride
+    pad = np.full((n - len(x),) + x.shape[1:], np.nan)
+    b = np.concatenate([x, pad]).reshape((n // stride, stride) + x.shape[1:])
+    ok = np.isfinite(b)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(ok.any(1), np.where(ok, b, 0).sum(1) / ok.sum(1), np.nan)
+
+
+def _js(v: np.ndarray) -> list:
+    return [None if not np.isfinite(x) else round(float(x), 4) for x in v]
 
 
 def _smooth(x: np.ndarray, win: int = 9) -> np.ndarray:
-    out = np.full_like(x, np.nan)
-    h = win // 2
-    for i in range(len(x)):
-        seg = x[max(0, i - h): i + h + 1]
-        if np.isfinite(seg).any():
-            out[i] = np.nanmean(seg)
-    return out
+    return nan_moving_mean(x, win)
 
 
 def tracks_figure(tracks) -> go.Figure:
@@ -35,7 +47,7 @@ def tracks_figure(tracks) -> go.Figure:
             ys += [tr.track_id + 1] * 3
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=f"Person {tr.track_id + 1}", showlegend=False,
-            line=dict(color=COLORS[k % len(COLORS)], width=10), connectgaps=False,
+            line=dict(color=dancer_color(k), width=10), connectgaps=False,
             hovertemplate=f"Person {tr.track_id + 1}: {tr.frames_present} frames, "
                           f"{tr.fragments} fragment(s) joined<extra></extra>"))
     n = max(len(tracks), 1)
@@ -58,10 +70,12 @@ def timeline_figure(dev: Deviation, t: np.ndarray, height: int | None = None) ->
         rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.08,
         subplot_titles=(f"Deviation from {source} (torso lengths)", "Deviation by body group"),
     )
+    stride = max(1, -(-len(t) // MAX_POINTS))
+    tx = _bin(np.asarray(t, float), stride).tolist()
     for d in scored:
         fig.add_trace(go.Scatter(
-            x=t.tolist(), y=[None if not np.isfinite(v) else round(float(v), 4) for v in _smooth(dev.score[:, d])], mode="lines", name=f"Dancer {d + 1}",
-            line=dict(color=COLORS[d % len(COLORS)], width=2), connectgaps=False,
+            x=tx, y=_js(_bin(_smooth(dev.score[:, d]), stride)), mode="lines", name=f"Dancer {d + 1}",
+            line=dict(color=dancer_color(d), width=2), connectgaps=False,
             hovertemplate="t=%{x:.2f}s  dev=%{y:.2f}<extra>Dancer " + str(d + 1) + "</extra>"),
             row=1, col=1)
 
@@ -69,10 +83,9 @@ def timeline_figure(dev: Deviation, t: np.ndarray, height: int | None = None) ->
     for d in scored:
         for g, v in dev.group.items():
             labels.append(f"D{d + 1} {g}")
-            rows.append(_smooth(v[:, d]))
+            rows.append(_bin(_smooth(v[:, d]), stride))
     fig.add_trace(go.Heatmap(
-        x=t.tolist(), y=labels,
-        z=[[None if not np.isfinite(v) else round(float(v), 4) for v in r] for r in rows], zmin=0, zmax=DEV_MAX,
+        x=tx, y=labels, z=[_js(r) for r in rows], zmin=0, zmax=DEV_MAX,
         colorscale=[[0, "#2fbf5b"], [0.5, "#f2d02e"], [1, "#e5383b"]],
         colorbar=dict(title="dev", len=0.45, y=0.2), hoverongaps=False,
         hovertemplate="t=%{x:.2f}s  %{y}: %{z:.2f}<extra></extra>"), row=2, col=1)

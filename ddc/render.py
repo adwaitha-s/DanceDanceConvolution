@@ -9,11 +9,10 @@ import cv2
 import numpy as np
 
 from .normalize import denormalize
+from .palette import dancer_bgr
 from .skeleton import CONF_THR, EDGE_IDX
 
 DEV_MAX = 0.5   # torso lengths at which a joint is drawn fully red
-TRACK_COLORS = [(255, 170, 60), (90, 200, 255), (200, 120, 255), (120, 255, 160),
-                (255, 120, 160), (200, 200, 90)]  # BGR, for dancer labels
 
 
 def dev_color(d: float) -> tuple:
@@ -122,7 +121,7 @@ def render_overlay(dense, dev, origin, scale, rot, t, out_path, video_path=None,
                 s = dev.score[f, d]
                 label = f"D{d + 1}  {s:.2f}" if np.isfinite(s) else f"D{d + 1}"
                 cv2.putText(canvas, label, (int(top[0]) - 20, max(int(top[1]) - 16, 16)),
-                            cv2.FONT_HERSHEY_SIMPLEX, max(0.5, h / 1400), TRACK_COLORS[d % len(TRACK_COLORS)],
+                            cv2.FONT_HERSHEY_SIMPLEX, max(0.5, h / 1400), dancer_bgr(d),
                             2, cv2.LINE_AA)
             cv2.putText(canvas, f"t={t[f]:.2f}s  dancers={int(dev.n_present[f])}", (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)

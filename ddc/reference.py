@@ -13,7 +13,7 @@ import numpy as np
 from . import io as ddc_io
 from .composite import _smooth_gaps
 from .normalize import normalize
-from .tracking import stabilize, to_dense
+from .tracking import cached_stabilize, to_dense
 
 
 def reference_from_track(norm: np.ndarray, idx: int, smooth: int = 5) -> np.ndarray:
@@ -42,7 +42,7 @@ def reference_from_solo(solo_run_dir, t_group: np.ndarray, offset: float = 0.0,
     det = ddc_io.load_jsonl(Path(solo_run_dir) / "tracking.jsonl")
     if det.n_frames < 2:
         raise ValueError("solo reference video has too few frames")
-    ids, n_tracks = stabilize(det.kps, fps=(det.n_frames - 1) / max(det.t[-1] - det.t[0], 1e-9))
+    ids, n_tracks, _ = cached_stabilize(det)
     if n_tracks == 0:
         raise ValueError("no persistent person found in the solo reference video")
     dense = to_dense(det.kps, ids, n_tracks)
