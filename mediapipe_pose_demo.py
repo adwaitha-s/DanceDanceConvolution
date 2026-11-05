@@ -12,7 +12,7 @@ Usage:
     python mediapipe_pose_demo.py                          # webcam, writes pose_stream.jsonl
     python mediapipe_pose_demo.py --source video.mp4 --out out.jsonl
     python mediapipe_pose_demo.py --source photo.jpg --no-display
-    python mediapipe_pose_demo.py --stdout --no-display | python examples/example_consumer.py
+    python mediapipe_pose_demo.py --stdout --no-display
 """
 
 from __future__ import annotations

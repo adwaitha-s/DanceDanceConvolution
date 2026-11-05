@@ -1,30 +1,16 @@
-import json
+import pytest
 
-from ddc.dancer_features import (
-    FEATURE_NAMES,
-    collect_track_features,
-    evaluate_run,
-    write_synthetic_demo,
-)
+from ddc.dancer_features import load_labels
 
 
-def test_synthetic_pose_features_and_selection_evaluation(tmp_path):
-    tracking = tmp_path / "tracking.jsonl"
-    labels = tmp_path / "labels.csv"
-    out = tmp_path / "out"
-    write_synthetic_demo(tracking, labels, frames=50)
+def test_load_human_reviewed_labels(tmp_path):
+    path = tmp_path / "labels.csv"
+    path.write_text("track_id,label\n0,dancer\n1,non_dancer\n2,yes\n3,bystander\n")
+    assert load_labels(path) == {0: 1, 1: 0, 2: 1, 3: 0}
 
-    rows = collect_track_features(tracking)
-    assert len(rows) == 8
-    assert all(len(row.values) == len(FEATURE_NAMES) for row in rows)
-    # The first four demo people dance and visibly move their wrists.
-    assert min(row.values[1] for row in rows[:4]) > max(row.values[1] for row in rows[4:])
 
-    report = evaluate_run(tracking, labels, out)
-    assert report["samples"] == 8
-    assert set(report["selected_features"]) == {"Filter", "Wrapper", "Embedded"}
-    assert (out / "track_features.csv").exists()
-    graph = out / "feature_selection_accuracy.svg"
-    assert graph.exists()
-    assert "Dancer vs non-dancer accuracy" in graph.read_text(encoding="utf-8")
-    assert json.loads((out / "feature_selection_report.json").read_text())["samples"] == 8
+def test_reject_unknown_label(tmp_path):
+    path = tmp_path / "labels.csv"
+    path.write_text("track_id,label\n0,maybe\n")
+    with pytest.raises(ValueError, match="unknown label"):
+        load_labels(path)

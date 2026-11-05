@@ -63,17 +63,17 @@ def test_pose_cache_round_trips_and_invalidates(tmp_path):
     assert ddc_io.load_jsonl(jl).n_frames == 30      # stale cache ignored
 
 
-def test_cached_stabilize_matches_and_persists(tmp_path):
+def test_stable_track_ids_are_cached_on_disk(tmp_path):
     jl = tmp_path / "tracking.jsonl"
     _write_run(jl)
     det = ddc_io.load_jsonl(jl)
-    want_ids, want_n = tracking.stabilize(det.kps, fps=30.0)
-    ids, n, info = tracking.cached_stabilize(det)
+    want_ids, want_n = tracking.stabilize(det.kps, fps=30.0, boxes=det.bbox)
+    ids, n, info = tracking.stable_track_ids(det, return_info=True)
     assert n == want_n == 2 and all((a == b).all() for a, b in zip(ids, want_ids))
     assert (tmp_path / "tracking.tracks.npz").exists()
     ids[0][:] = -5                                   # callers get copies
-    tracking._MEMO.clear()
-    again, n2, info2 = tracking.cached_stabilize(ddc_io.load_jsonl(jl))   # from disk
+    tracking._TRACK_CACHE.clear()
+    again, n2, info2 = tracking.stable_track_ids(ddc_io.load_jsonl(jl), return_info=True)  # disk
     assert n2 == n and all((a == b).all() for a, b in zip(again, want_ids))
     assert info2["fragments"] == info["fragments"]
 
