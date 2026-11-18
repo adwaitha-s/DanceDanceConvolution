@@ -454,3 +454,11 @@ With a dancer selected, **Download report** saves their report as a standalone
 HTML page (score, coverage, personalized feedback, practice moments involving
 them, worst moments, and how scores work) to `runs/<run>/reports/`. It opens in
 any browser and prints cleanly, so it can be shared with the dancer directly.
+
+The individual report starts with a compact **practice brief**: score, Going well,
+Focus next, and at most two clickable timestamped suggestions. Advice uses the
+existing pose evidence and retains directional qualifications. **Full analysis ·
+tables, timeline & export** is closed initially and contains all the original
+filtered tables, measurements, group timeline, current-frame feedback, scoring
+explanation, and CSV. Changing the dancer closes that panel again. Limited data
+and reference dancers remain explicit; no scores or analysis rules changed.
