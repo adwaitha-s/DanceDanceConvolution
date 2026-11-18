@@ -92,7 +92,7 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     own = app.filter_dancer_report(rows[0][0], 0)
     assert own[0] == rows and own[2] == feedback
     assert 'Dancer 1 (Person 2): reference' not in own[4]
-    assert 'Area to review' in own[5] and '40/40' in own[5]
+    assert 'Focus next' in own[5] and '40/40' in own[5]
     assert own[6]['visible'] is True
     report = Path(own[6]['value'])
     assert report.parent == run / 'reports' and report.suffix == '.html'
@@ -225,7 +225,7 @@ def test_individual_report_missing_score_reference_and_escaping(monkeypatch):
     ref = app.dancer_report('Reference <1>')
     assert 'not scored' in ref and 'Reference &lt;1&gt;' in ref
     html = app.dancer_report('Dancer <2>')
-    assert 'N/A' in html and '0/20' in html and 'Limited pose coverage' in html
+    assert 'N/A' in html and '0/20' in html and 'Not enough reliable pose data' in html
     assert 'Dancer &lt;2&gt;' in html and '<script>' not in html
     assert 'Choose a dancer' in app.dancer_report('All dancers')
 
@@ -274,3 +274,30 @@ def test_practice_moment_errors_leave_results_usable(tmp_path, monkeypatch):
                               False, 5, app.REF_COMPOSITE, None, None, 0)
     assert outputs[12] == []
     assert 'Practice moments unavailable' in outputs[6]
+
+
+def test_practice_brief_is_short_scoped_and_preserves_evidence(monkeypatch):
+    from types import SimpleNamespace
+    import app
+    dancer = {'reference': False, 'score': 81.2, 'valid_frames': 90, 'total_frames': 100,
+              'coverage': .9, 'strength': 'Closest region: torso (0.05 torso lengths)',
+              'improvement': 'Review left wrist (0.46 torso lengths); largest region deviation: arms'}
+    suggestions = [
+        ['Dancer 2', 1., 'Your left wrist is lower than the reference at 1.00 seconds in the normalized camera view. Review its height relative to your hips.'],
+        ['Dancer 2', 3., 'Your right ankle differs from the reference at 3.00 seconds by 0.55 torso lengths. Review this joint in the overlay.'],
+        ['Dancer 2', 5., 'More detail retained'],
+        ['Dancer 1', 2., 'Someone else'],
+    ]
+    monkeypatch.setattr(app, '_LAST', {'names': ['Dancer 2'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[dancer])),
+        'report_rows': ([], [], suggestions, [])})
+    html = app.dancer_report('Dancer 2')
+    assert '81.2' in html and 'Going well' in html and 'Focus next' in html
+    assert 'Closest match: torso' in html and 'Review left wrist' in html
+    assert 'lower than the reference in the normalized camera view.' in html
+    assert 'Your right ankle differs from the reference.' in html
+    assert 'torso lengths' not in html and 'largest region deviation' not in html
+    assert html.count('data-ddc-time=') == 2
+    assert 'data-ddc-time="1.000000"' in html and 'data-ddc-time="3.000000"' in html
+    assert 'Someone else' not in html and 'More detail retained' not in html
+    assert len(app._LAST['report_rows'][2]) == 4  # no detailed suggestions discarded
