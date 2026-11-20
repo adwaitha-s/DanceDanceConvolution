@@ -454,3 +454,31 @@ With a dancer selected, **Download report** saves their report as a standalone
 HTML page (score, coverage, personalized feedback, practice moments involving
 them, worst moments, and how scores work) to `runs/<run>/reports/`. It opens in
 any browser and prints cleanly, so it can be shared with the dancer directly.
+
+The individual report starts with a compact **practice brief**: score, Going well and
+Focus next (both averaged over the whole clip), and at most two clickable timestamped
+suggestions (the biggest single moments). Advice uses the
+existing pose evidence and retains directional qualifications. **Full analysis ·
+tables, timeline & export** is closed initially and contains all the original
+filtered tables, measurements, group timeline, current-frame feedback, scoring
+explanation, and CSV. Changing the dancer closes that panel again. Limited data
+and reference dancers remain explicit; no scores or analysis rules changed.
+
+#### Compare feedback designs with your team
+
+In **Results**, select a dancer under **Feedback report for**, then use **Report
+style** to switch between **Quick brief** (the existing two-suggestion summary)
+and **Guided review** (one moment at a time). Both use the same cached analysis;
+changing styles only re-renders the report, not tracking, comparison or the tables.
+
+Guided review places the video beside one timestamped coaching note. **Replay this
+moment**, **Previous**, **Next moment**, and the moment dots seek the existing
+overlay. Replay starts playback; navigation pauses at the chosen moment. The first/last navigation buttons disable at the ends. Switching dancer
+or style restarts the review at its first card. A single available moment needs
+no navigation, and missing feedback shows an explicit message. Reference dancers
+remain unscored; their available pairwise review moments use neutral wording.
+
+**Full analysis · tables, timeline & export** retains the full group practice-card
+list, filtered dancer tables, timeline, frame inspection, methodology, and CSV.
+The group score overview is inside Full analysis, while the selected dancer’s score stays beside the video. The standalone HTML **Download report** remains available. This is a presentation
+change: scoring, timing tolerance, and pose-analysis thresholds are unchanged.
