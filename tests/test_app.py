@@ -359,3 +359,30 @@ def test_guided_reference_uses_neutral_pair_moments_and_escapes_html(monkeypatch
     app._LAST['report_rows'] = ([], [], [], [])
     assert 'No specific moments' in app.dancer_report('Reference <1>')
     assert 'ddc-review-nav' not in app.dancer_report('Reference <1>')
+
+
+def test_both_report_styles_skip_untimed_feedback_and_label_whole_clip_summary(monkeypatch):
+    from types import SimpleNamespace
+    import app
+    c = {'reference': False, 'score': 70., 'valid_frames': 9, 'total_frames': 10, 'coverage': .9,
+         'strength': 'Closest region: torso (0.05 torso lengths)',
+         'improvement': 'Review right wrist (0.46 torso lengths); largest region deviation: arms'}
+    feedback = [['Dancer 2', float('nan'), 'Your left ankle differs from the reference. Review this joint.'],
+                ['Dancer 2', 2., 'Your left wrist differs from the reference at 2.00 seconds by 0.50 torso lengths. Review this joint.']]
+    monkeypatch.setattr(app, '_LAST', {'names': ['Dancer 2'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[c])),
+        'report_rows': ([], [], feedback, [])})
+    for style in ('Quick brief', 'Guided review'):
+        html = app.dancer_report('Dancer 2', style)
+        assert 'nan' not in html and 'left ankle' not in html
+        assert 'data-ddc-time="2.000000"' in html
+        assert 'Focus next · whole clip' in html and 'role="status"' not in html
+    assert 'aria-live="polite"' in app.dancer_report('Dancer 2', 'Guided review')
+
+
+def test_report_style_switch_only_rerenders_the_report():
+    import app
+    handlers = [d for d in app.demo.config['dependencies']
+                if any(app.demo.blocks[t[0]].label == 'Report style'
+                       for t in d['targets'] if t[0] in app.demo.blocks)]
+    assert len(handlers) == 1 and len(handlers[0]['outputs']) == 1

@@ -551,6 +551,43 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
             dancer_report("All dancers", report_style), gr.update(value=None, visible=False))
 
 
+def _short_feedback(message):
+    """Coaching line without its timestamp, distance, or the repeated "Review ..." instruction."""
+    short = message.split(". Review")[0].rstrip(".")
+    short = re.sub(r" at [0-9]+\.[0-9]+ seconds", "", short)
+    return re.sub(r" by [0-9]+\.[0-9]+ torso lengths", "", short) + "."
+
+
+def _joint_moments(dancer):
+    """(time, title, short message) for the dancer's own timestamped joint suggestions."""
+    moments = []
+    for _, stamp, message in _report_rows(dancer)[2]:
+        if not np.isfinite(stamp):
+            continue
+        joint = next((name.replace("_", " ") for name in BODY
+                      if message.startswith(f"Your {name.replace('_', ' ')} ")), None)
+        moments.append((float(stamp), f"Review your {joint}" if joint else "Review this moment",
+                        _short_feedback(message)))
+    return moments
+
+
+def _score_notes(c):
+    """Strength/focus summary (whole clip) and any coverage warning for a scored dancer."""
+    strength = c["strength"].split(" (")[0].replace("Closest region: ", "Closest match: ")
+    focus = c["improvement"].split(" (")[0]
+    if c["score"] is None:
+        note = '<p class="ddc-coverage-note">Not enough reliable pose data to give a score or coaching advice.</p>'
+    elif c["coverage"] < .5:
+        note = '<p class="ddc-coverage-note">Limited pose coverage; this score may be misleading.</p>'
+    else:
+        note = ''
+    return strength, focus, note
+
+
+def _score_text(c):
+    return f'{c["score"]:.1f}<span> / 100</span>' if c["score"] is not None else 'N/A'
+
+
 def dancer_brief(dancer):
     """A short practice brief; full measurements remain in the analysis panel."""
     names = _LAST.get("names", [])
@@ -563,27 +600,17 @@ def dancer_brief(dancer):
     if c["reference"]:
         body = heading + '</header><p>Reference dancer · not scored.</p><p>Open Full analysis to review pairwise moments involving this dancer.</p>'
     else:
-        score = f'{c["score"]:.1f}<span> / 100</span>' if c["score"] is not None else 'N/A'
-        strength = c["strength"].split(" (")[0].replace("Closest region: ", "Closest match: ")
-        focus = c["improvement"].split(" (")[0]
-        body = (heading + f'<p class="ddc-dancer-score">{score}</p></header>'
+        strength, focus, note = _score_notes(c)
+        body = (heading + f'<p class="ddc-dancer-score">{_score_text(c)}</p></header>'
                 '<div class="ddc-brief-highlights">'
-                f'<div><p class="ddc-eyebrow">Going well</p><p>{escape(strength)}</p></div>'
-                f'<div><p class="ddc-eyebrow">Focus next</p><p>{escape(focus)}</p></div></div>')
-        if c["score"] is None:
-            body += '<p class="ddc-coverage-note">Not enough reliable pose data to give a score or coaching advice.</p>'
-        elif c["coverage"] < .5:
-            body += '<p class="ddc-coverage-note">Limited pose coverage; this score may be misleading.</p>'
-        # Reuse the original evidence-based wording; only remove repeated instructions.
-        feedback = _LAST.get("report_rows", ([], [], [], []))[2]
-        own = [r for r in feedback if r[0] == dancer][:2]
+                f'<div><p class="ddc-eyebrow">Going well · whole clip</p><p>{escape(strength)}</p></div>'
+                f'<div><p class="ddc-eyebrow">Focus next · whole clip</p><p>{escape(focus)}</p></div></div>'
+                + note)
+        own = _joint_moments(dancer)[:2]
         if own:
-            body += '<h4>Try these moments</h4><div class="ddc-brief-moments">'
-            for _, stamp, message in own:
-                short = message.split(". Review")[0].rstrip(".")
-                short = re.sub(r" at [0-9]+\.[0-9]+ seconds", "", short)
-                short = re.sub(r" by [0-9]+\.[0-9]+ torso lengths", "", short) + "."
-                body += (f'<button type="button" class="ddc-brief-moment" data-ddc-time="{float(stamp):.6f}" '
+            body += '<h4>Biggest single moments</h4><div class="ddc-brief-moments">'
+            for stamp, _, short in own:
+                body += (f'<button type="button" class="ddc-brief-moment" data-ddc-time="{stamp:.6f}" '
                          f'aria-label="Replay {escape(dancer, quote=True)} at {stamp:.2f} seconds">'
                          f'<span class="ddc-brief-time">{stamp:.2f} s <span aria-hidden="true">↗</span></span>'
                          f'<span>{escape(short)}</span></button>')
@@ -603,20 +630,10 @@ def dancer_report(dancer, style="Guided review"):
 
 def _review_moments(dancer):
     """Use existing timestamped evidence, scoped to one dancer, without new claims."""
-    _, _, feedback, priority = _report_rows(dancer)
-    moments = []
-    for _, stamp, message in feedback:
-        if not np.isfinite(stamp):
-            continue
-        joint = next((name.replace("_", " ") for name in BODY
-                      if message.startswith(f"Your {name.replace('_', ' ')} ")), None)
-        short = message.split(". Review")[0].rstrip(".")
-        short = re.sub(r" at [0-9]+\.[0-9]+ seconds", "", short)
-        short = re.sub(r" by [0-9]+\.[0-9]+ torso lengths", "", short) + "."
-        moments.append((float(stamp), f"Review your {joint}" if joint else "Review this moment", short))
+    moments = _joint_moments(dancer)
     # Reference dancers have no scored joint suggestions. Pair comparisons are neutral.
     if not moments:
-        for row in priority:
+        for row in _report_rows(dancer)[3]:
             if np.isfinite(row[1]):
                 moments.append((float(row[1]), f"Review {row[5]}",
                                 f"Pose difference between {row[0]}. Review the video; "
@@ -632,26 +649,21 @@ def guided_dancer_report(dancer):
     if dancer not in names or _LAST.get("res") is None:
         return '<p class="ddc-empty">Compare dancers to load an individual report.</p>'
     c = _LAST["res"].coaching.dancers[names.index(dancer)]
-    score = ('Reference · not scored' if c["reference"] else
-             f'{c["score"]:.1f}<span> / 100</span>' if c["score"] is not None else 'N/A')
+    score = 'Reference · not scored' if c["reference"] else _score_text(c)
     body = (f'<header class="ddc-review-header"><h3>{escape(dancer)}</h3>'
             f'<p class="ddc-dancer-score">{score}</p></header>')
     if not c["reference"]:
-        strength = c["strength"].split(" (")[0].replace("Closest region: ", "Closest match: ")
-        focus = c["improvement"].split(" (")[0]
-        body += (f'<div class="ddc-review-summary"><p><span>Going well</span>{escape(strength)}</p>'
-                 f'<p><span>Focus next</span>{escape(focus)}</p></div>')
-        if c["score"] is None:
-            body += '<p class="ddc-coverage-note">Not enough reliable pose data to give a score or coaching advice.</p>'
-        elif c["coverage"] < .5:
-            body += '<p class="ddc-coverage-note">Limited pose coverage; this score may be misleading.</p>'
+        strength, focus, note = _score_notes(c)
+        body += (f'<div class="ddc-review-summary"><p><span>Going well · whole clip</span>{escape(strength)}</p>'
+                 f'<p><span>Focus next · whole clip</span>{escape(focus)}</p></div>' + note)
     moments = _review_moments(dancer)
     if moments:
-        body += '<div class="ddc-review-deck" data-review-index="0">'
+        # One live region for the deck, so only the newly shown card is announced.
+        body += '<div class="ddc-review-deck" data-review-index="0" aria-live="polite">'
         for i, (stamp, title, message) in enumerate(moments):
             hidden = ' hidden' if i else ''
             body += (f'<article class="ddc-review-step" data-review-time="{stamp:.6f}"{hidden}>'
-                     f'<div class="ddc-review-meta"><p role="status">Moment {i + 1} of {len(moments)}</p>'
+                     f'<div class="ddc-review-meta"><p>Moment {i + 1} of {len(moments)}</p>'
                      f'<p>{stamp:.2f} s</p></div><h4>{escape(title)}</h4><p>{escape(message)}</p>'
                      f'<button type="button" class="ddc-replay" data-ddc-time="{stamp:.6f}" '
                      f'aria-label="Replay {escape(dancer, quote=True)} at {stamp:.2f} seconds">'
@@ -906,7 +918,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
 
         with gr.Tab("3 · Results", id=TAB_RESULTS):
             result_title = gr.Markdown(NO_RESULT_HINT, elem_id="ddc_result_title")
-            gr.Markdown("### Review your practice\nPick a dancer, then work through one moment at a time.")
+            gr.Markdown("### Review your practice\nPick a dancer to see their score and the moments worth replaying.")
             report_style = gr.Radio(["Quick brief", "Guided review"], value="Guided review",
                                     label="Report style", interactive=True,
                                     info="Compare both designs using the same analysis. Switching styles does not rerun pose detection.")
@@ -924,7 +936,6 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                     individual_report = gr.HTML(elem_id="ddc_individual_report")
 
             with gr.Accordion("Full analysis · tables, timeline & export", open=False, elem_id="ddc_full_analysis") as details_panel:
-                full_analysis = details_panel
                 overview = gr.HTML(elem_id="ddc_score_overview")
                 gr.Markdown("### Group practice moments\nAll detected priorities remain available here.")
                 practice_tbl = gr.HTML(elem_id="ddc_practice_preview")
@@ -1019,11 +1030,10 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
     report_dancer.change(filter_dancer_report, inputs=[report_dancer, t_slider, report_style],
                          outputs=[summary_tbl, moments_tbl, feedback_tbl, key_moments_tbl,
                                   detail, individual_report, report_download]).then(
-                             lambda: gr.update(open=False), outputs=full_analysis)
-    report_style.change(filter_dancer_report, inputs=[report_dancer, t_slider, report_style],
-                        outputs=[summary_tbl, moments_tbl, feedback_tbl, key_moments_tbl,
-                                 detail, individual_report, report_download]).then(
-                            lambda: gr.update(open=False), outputs=full_analysis)
+                             lambda: gr.update(open=False), outputs=details_panel)
+    # Style only changes how the cached report is presented; tables stay as they are.
+    report_style.change(dancer_report, inputs=[report_dancer, report_style],
+                        outputs=individual_report)
     t_slider.change(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
     moments_tbl.select(jump_to_moment, inputs=moments_tbl, outputs=t_slider
     ).then(frame_detail, inputs=[t_slider, report_dancer], outputs=detail, js=_SEEK_ON_SLIDER_JS)
@@ -1083,7 +1093,7 @@ _CSS = """
 .ddc-overview > .ddc-coverage-note, .ddc-overview > .ddc-muted { grid-column: 1 / -1; }
 #ddc_practice_row { gap: 24px; align-items: flex-start; }
 #ddc_practice_col { gap: 14px; }
-#ddc_practice_col h3, #ddc_details h3 { font-size: 21px; font-weight: 600; letter-spacing: -.035em; }
+#ddc_practice_col h3, #ddc_full_analysis h3 { font-size: 21px; font-weight: 600; letter-spacing: -.035em; }
 #ddc_practice_col p { font-size: 13px; line-height: 1.65; }
 .ddc_small_note p { font-size: 12px !important; line-height: 1.65; }
 .ddc-moments { list-style: none !important; margin: 0 !important; padding: 0 !important; display: grid; gap: 10px; }
@@ -1116,11 +1126,11 @@ _CSS = """
 .ddc-review-step > p { font-size: 15px; line-height: 1.7; }
 .ddc-review button { font: inherit; cursor: pointer; }
 .ddc-replay { width: 100%; margin: 20px 0; padding: 14px; border-radius: 10px; border: 1px solid var(--button-primary-background-fill); background: var(--button-primary-background-fill); color: var(--button-primary-text-color); }
-.ddc-review-nav { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px 0; border-top: 1px solid var(--border-color-primary); }
-.ddc-review-nav > button { border: 1px solid var(--border-color-primary); background: var(--background-fill-secondary); color: var(--body-text-color); border-radius: 8px; padding: 10px; font-size: 12px; }
+.ddc-review-nav { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 12px 0; border-top: 1px solid var(--border-color-primary); }
+.ddc-review-nav > button { border: 1px solid var(--border-color-primary); background: var(--background-fill-secondary); color: var(--body-text-color); border-radius: 8px; padding: 10px; font-size: 12px; white-space: nowrap; }
 .ddc-review-nav > button:disabled { opacity: .4; cursor: default; }
-.ddc-review-dots { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; }
-.ddc-review-dot { width: 22px; height: 28px; border: none; background: transparent; position: relative; }
+.ddc-review-dots { display: flex; flex-wrap: wrap; justify-content: center; }
+#ddc_individual_report .ddc-review-dot { width: 18px; height: 28px; padding: 0; margin: 0; min-width: 0; border: none; background: transparent; position: relative; }
 .ddc-review-dot::after { content: ''; display: block; width: 7px; height: 7px; border-radius: 50%; background: var(--body-text-color-subdued); opacity: .35; margin: auto; }
 .ddc-review-dot[aria-current=step]::after { opacity: 1; background: var(--body-text-color); }
 .ddc-review button:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
@@ -1138,10 +1148,9 @@ _CSS = """
 .ddc-brief-moment:hover { border-color: var(--body-text-color-subdued); }
 .ddc-brief-moment:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
 .ddc-brief-footnote { color: var(--body-text-color-subdued); font-size: 12px; line-height: 1.65; margin: 20px 0 0; }
-#ddc_full_analysis { border-radius: 12px; margin-top: 8px; }
-#ddc_details { margin-top: 24px; border: 1px solid var(--border-color-primary); border-radius: 16px; }
-#ddc_details > button { padding: 20px; font-size: 15px; }
-#ddc_details > button:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
+#ddc_full_analysis { margin-top: 24px; border: 1px solid var(--border-color-primary); border-radius: 16px; }
+#ddc_full_analysis > button { padding: 20px; font-size: 15px; }
+#ddc_full_analysis > button:focus-visible { outline: 2px solid var(--body-text-color); outline-offset: 3px; }
 #ddc_timeline .ddc-playhead { position: absolute; width: 2px; margin-left: -1px; background: #8895c5; opacity: .85; pointer-events: none; z-index: 5; display: none; }
 @media (max-width: 700px) {
   .gradio-container { padding: 20px 16px 40px !important; }
