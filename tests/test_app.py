@@ -95,7 +95,7 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     own = app.filter_dancer_report(rows[0][0], 0)
     assert own[0] == rows and own[2] == feedback
     assert 'Dancer 1 (Person 2): reference' not in own[4]
-    assert 'Area to review' in own[5] and '40/40' in own[5]
+    assert 'Focus next' in own[5] and '40/40' in own[5]
     assert own[6]['visible'] is True
     report = Path(own[6]['value'])
     assert report.parent == run / 'reports' and report.suffix == '.html'
@@ -228,7 +228,7 @@ def test_individual_report_missing_score_reference_and_escaping(monkeypatch):
     ref = app.dancer_report('Reference <1>')
     assert 'not scored' in ref and 'Reference &lt;1&gt;' in ref
     html = app.dancer_report('Dancer <2>')
-    assert 'N/A' in html and '0/20' in html and 'Limited pose coverage' in html
+    assert 'N/A' in html and '0/20' in html and 'Not enough reliable pose data' in html
     assert 'Dancer &lt;2&gt;' in html and '<script>' not in html
     assert 'Choose a dancer' in app.dancer_report('All dancers')
 
@@ -424,3 +424,114 @@ def test_split_swap_undo_and_saved_edit_log_reopen(tmp_path, monkeypatch):
     assert len(app.run_undo(run.name)[0]) == n
     with pytest.raises(app.gr.Error, match="Nothing to undo"):
         app.run_undo(run.name)
+
+def test_practice_brief_is_short_scoped_and_preserves_evidence(monkeypatch):
+    from types import SimpleNamespace
+    import app
+    dancer = {'reference': False, 'score': 81.2, 'valid_frames': 90, 'total_frames': 100,
+              'coverage': .9, 'strength': 'Closest region: torso (0.05 torso lengths)',
+              'improvement': 'Review left wrist (0.46 torso lengths); largest region deviation: arms'}
+    suggestions = [
+        ['Dancer 2', 1., 'Your left wrist is lower than the reference at 1.00 seconds in the normalized camera view. Review its height relative to your hips.'],
+        ['Dancer 2', 3., 'Your right ankle differs from the reference at 3.00 seconds by 0.55 torso lengths. Review this joint in the overlay.'],
+        ['Dancer 2', 5., 'More detail retained'],
+        ['Dancer 1', 2., 'Someone else'],
+    ]
+    monkeypatch.setattr(app, '_LAST', {'names': ['Dancer 2'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[dancer])),
+        'report_rows': ([], [], suggestions, [])})
+    html = app.dancer_report('Dancer 2', 'Quick brief')
+    assert '81.2' in html and 'Going well' in html and 'Focus next' in html
+    assert 'Closest match: torso' in html and 'Review left wrist' in html
+    assert 'lower than the reference in the normalized camera view.' in html
+    assert 'Your right ankle differs from the reference.' in html
+    assert 'torso lengths' not in html and 'largest region deviation' not in html
+    assert html.count('data-ddc-time=') == 2
+    assert 'data-ddc-time="1.000000"' in html and 'data-ddc-time="3.000000"' in html
+    assert 'Someone else' not in html and 'More detail retained' not in html
+    assert len(app._LAST['report_rows'][2]) == 4  # no detailed suggestions discarded
+
+
+def test_guided_review_renders_one_visible_moment_with_all_navigation(monkeypatch):
+    from html.parser import HTMLParser
+    from types import SimpleNamespace
+    import app
+    class Articles(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.articles = []
+            self.buttons = []
+        def handle_starttag(self, tag, attrs):
+            if tag == 'article':
+                self.articles.append(dict(attrs))
+            if tag == 'button':
+                self.buttons.append(dict(attrs))
+    c = {'reference': False, 'score': 81.2, 'valid_frames': 90, 'total_frames': 100,
+         'coverage': .9, 'strength': 'Closest region: torso (0.05 torso lengths)',
+         'improvement': 'Review left wrist (0.46 torso lengths)'}
+    feedback = [['Dancer 2', float(i), f'Your left wrist differs from the reference at {i:.2f} seconds by 0.50 torso lengths. Review this joint in the overlay.']
+                for i in (1, 3, 5)] + [['Dancer 1', 7., 'Someone else']]
+    monkeypatch.setattr(app, '_LAST', {'names': ['Dancer 2'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[c])),
+        'report_rows': ([], [], feedback, [])})
+    html = app.dancer_report('Dancer 2', 'Guided review')
+    parsed = Articles()
+    parsed.feed(html)
+    assert len(parsed.articles) == 3
+    assert ['hidden' in a for a in parsed.articles] == [False, True, True]
+    assert [float(a['data-review-time']) for a in parsed.articles] == [1., 3., 5.]
+    assert len([b for b in parsed.buttons if 'data-ddc-time' in b]) == 3
+    assert len([b for b in parsed.buttons if 'data-review-go' in b]) == 3
+    previous = next(b for b in parsed.buttons if b.get('data-review-delta') == '-1')
+    assert 'disabled' in previous
+    assert 'Moment 1 of 3' in html and 'Moment 3 of 3' in html
+    assert 'Someone else' not in html and 'torso lengths' not in html
+    assert len(app._LAST['report_rows'][2]) == 4
+    brief = app.dancer_report('Dancer 2', 'Quick brief')
+    assert brief.count('data-ddc-time=') == 2 and 'ddc-review-step' not in brief
+    assert 'data-review-index="0"' in app.dancer_report('Dancer 2')  # reset on rerender
+
+
+def test_guided_reference_uses_neutral_pair_moments_and_escapes_html(monkeypatch):
+    from types import SimpleNamespace
+    import app
+    monkeypatch.setattr(app, '_LAST', {'names': ['Reference <1>'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[{'reference': True}])),
+        'report_rows': ([], [], [], [['Reference <1> & Dancer 2', 2., 1., 3., 'arms', '<wrist>', .3, 17]]),
+        'report_pairs': [('Reference <1>', 'Dancer 2')]})
+    html = app.dancer_report('Reference <1>')
+    assert 'not scored' in html and 'Moment 1 of 1' in html
+    assert 'which dancer should change' in html
+    assert '&lt;wrist&gt;' in html and '<wrist>' not in html
+    assert 'Previous' not in html and 'Next moment' not in html
+    assert 'data-ddc-time="2.000000"' in html
+    app._LAST['report_rows'] = ([], [], [], [])
+    assert 'No specific moments' in app.dancer_report('Reference <1>')
+    assert 'ddc-review-nav' not in app.dancer_report('Reference <1>')
+
+
+def test_both_report_styles_skip_untimed_feedback_and_label_whole_clip_summary(monkeypatch):
+    from types import SimpleNamespace
+    import app
+    c = {'reference': False, 'score': 70., 'valid_frames': 9, 'total_frames': 10, 'coverage': .9,
+         'strength': 'Closest region: torso (0.05 torso lengths)',
+         'improvement': 'Review right wrist (0.46 torso lengths); largest region deviation: arms'}
+    feedback = [['Dancer 2', float('nan'), 'Your left ankle differs from the reference. Review this joint.'],
+                ['Dancer 2', 2., 'Your left wrist differs from the reference at 2.00 seconds by 0.50 torso lengths. Review this joint.']]
+    monkeypatch.setattr(app, '_LAST', {'names': ['Dancer 2'],
+        'res': SimpleNamespace(coaching=SimpleNamespace(dancers=[c])),
+        'report_rows': ([], [], feedback, [])})
+    for style in ('Quick brief', 'Guided review'):
+        html = app.dancer_report('Dancer 2', style)
+        assert 'nan' not in html and 'left ankle' not in html
+        assert 'data-ddc-time="2.000000"' in html
+        assert 'Focus next · whole clip' in html and 'role="status"' not in html
+    assert 'aria-live="polite"' in app.dancer_report('Dancer 2', 'Guided review')
+
+
+def test_report_style_switch_only_rerenders_the_report():
+    import app
+    handlers = [d for d in app.demo.config['dependencies']
+                if any(app.demo.blocks[t[0]].label == 'Report style'
+                       for t in d['targets'] if t[0] in app.demo.blocks)]
+    assert len(handlers) == 1 and len(handlers[0]['outputs']) == 1
