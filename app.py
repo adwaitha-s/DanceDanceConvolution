@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import functools
 import json
 import os
@@ -32,6 +33,7 @@ from ddc import identity
 from ddc.dancer_features import load_labels
 from ddc.identity_learning import initialize_predictions, save_merge_review
 from ddc.io import load_jsonl
+from ddc.palette import dancer_color
 from ddc.tracking import stable_track_ids
 from ddc.plots import timeline_figure, tracks_figure
 from ddc.skeleton import BODY
@@ -116,13 +118,22 @@ def _comparable(run_dir: Path) -> bool:
         return True
 
 
+def _run_status(run_dir: Path) -> str:
+    """How far a run got, so runs of the same video can be told apart in the list."""
+    if (run_dir / "deviation.csv").exists():
+        return " · compared"
+    if (run_dir / "labels.csv").exists():
+        return " · dancers reviewed"
+    return ""
+
+
 def list_runs() -> list[tuple[str, str]]:
     """(label, run name) for every run that can be compared, newest first."""
     if not RUNS_DIR.exists():
         return []
     names = sorted((p.name for p in RUNS_DIR.iterdir() if p.is_dir() and _comparable(p)),
                    reverse=True)
-    return [(_run_label(RUNS_DIR / n), n) for n in names]
+    return [(_run_label(RUNS_DIR / n) + _run_status(RUNS_DIR / n), n) for n in names]
 
 
 def _runs_update(value=None):
@@ -289,8 +300,8 @@ def _show_people(run_name, groups, progress=None):
     else:
         headline = ("Automatic selection isn't available yet, so **everyone is ticked**. "
                     "Untick anyone who isn't dancing.")
-    gallery = [(tr.thumbnail, tr.label) for tr in tracks]
-    return (gallery, gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
+    _LAST["thumbs"] = {tr.track_id: _thumb_uri(tr.thumbnail) for tr in tracks}
+    return (_people_css(tracks), gr.update(choices=labels, value=selected), gr.update(choices=labels, value=None),
             gr.update(choices=labels, value=[]), tracks_figure(tracks),
             gr.update(value=None, visible=False), note, headline,  # preview is on demand
             _review_status(selected), gr.update(interactive=True),
@@ -302,8 +313,57 @@ def _show_people(run_name, groups, progress=None):
              "Fix who's who below, then save to teach future analyses."))
 
 
+def _thumb_uri(image, height: int = 160) -> str:
+    """Small JPEG data URI of an RGB crop, for use in CSS (empty if there is no crop)."""
+    if image is None or not getattr(image, "size", 0):
+        return ""
+    h, w = image.shape[:2]
+    if h > height:
+        image = cv2.resize(image, (max(1, round(w * height / h)), height),
+                           interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return "data:image/jpeg;base64," + base64.b64encode(buf).decode() if ok else ""
+
+
+def _card_rule(selectors, k: int, uri: str, color: str | None = None, caption: str = "") -> str:
+    """CSS giving the k-th (1-based) checkbox/radio card in each list its picture."""
+    # ":root" outranks the app stylesheet, which Gradio prefixes with its container class.
+    before = ", ".join(f":root {s} .wrap > label:nth-child({k})::before" for s in selectors)
+    image = f"url('{uri}')" if uri else "none"
+    rule = f"{before} {{ background-image: {image};"
+    rule += f" border-bottom-color: {color}; }}" if color else " }"
+    if caption:
+        after = ", ".join(f":root {s} .wrap > label:nth-child({k})::after" for s in selectors)
+        rule += f' {after} {{ content: "{caption}"; }}'
+    return rule
+
+
+def _people_css(tracks) -> str:
+    """Per-run styles that put each person's thumbnail on their step-2 checkbox cards.
+
+    The checkboxes stay Gradio's own (they hold the state); this only decorates them,
+    in the same order and timeline color as the "When each person is visible" plot."""
+    rules = [_card_rule(("#ddc_track_select", "#ddc_merge_select"), k + 1,
+                        _thumb_uri(tr.thumbnail), dancer_color(k))
+             for k, tr in enumerate(tracks)]
+    return f"<style>{''.join(rules)}</style>"
+
+
+def _results_css(names, scores) -> str:
+    """Thumbnail and score on each step-3 dancer card ("All dancers" is card 1)."""
+    thumbs, ids = _LAST.get("thumbs", {}), _LAST.get("compared_ids", [])
+    rules = []
+    for d, (tid, score) in enumerate(zip(ids, scores)):
+        caption = ("reference" if score == "reference" else
+                   f"{score:.1f} / 100" if isinstance(score, float) else "no score")
+        rules.append(_card_rule(("#ddc_report_dancer",), d + 2, thumbs.get(tid, ""),
+                                caption=caption))
+    return f"<style>{''.join(rules)}</style>"
+
+
 N_PEOPLE_OUTPUTS = 11   # length of the tuple _show_people returns
-N_RESULT_OUTPUTS = 16   # step-3 components begin_review blanks (`result_outputs`)
+N_RESULT_OUTPUTS = 17   # step-3 components begin_review blanks (`result_outputs`)
 
 
 def begin_review(run_name):
@@ -319,7 +379,7 @@ def begin_review(run_name):
             # step 3
             NO_RESULT_HINT, None, None, [], [], "", None, "", [], [], "", "", gr.update(open=False),
             gr.update(choices=["All dancers"], value="All dancers"), "",
-            gr.update(value=None, visible=False))
+            gr.update(value=None, visible=False), "")
 
 
 def _describe_history() -> str:
@@ -642,6 +702,8 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
              for d, p in enumerate(people)]
 
     _LAST["names"] = names
+    _LAST["compared_ids"] = sorted(selected)
+    card_scores = ["reference" if c["reference"] else c["score"] for c in res.coaching.dancers]
     rows, moments = [], []
     for d, s in enumerate(res.summary):
         if d == res.dev.reference_track:
@@ -684,7 +746,8 @@ def run_compare(run_name, track_choice, loo_choice, rotate, smooth,
             frame_detail(0), _review_status(track_choice), feedback, key_rows,
             results_overview(res, names, key_rows), practice_preview(key_rows), gr.update(open=False),
             gr.update(choices=["All dancers"] + names, value="All dancers"),
-            dancer_report("All dancers", report_style), gr.update(value=None, visible=False))
+            dancer_report("All dancers", report_style), gr.update(value=None, visible=False),
+            _results_css(names, card_scores))
 
 
 def _short_feedback(message):
@@ -978,7 +1041,7 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                             minimum=1, maximum=12, step=1, value=4, visible=False,
                             label="Number of people in video (MediaPipe only -- YOLO/RTMW have no cap)",
                         )
-                    run_btn = gr.Button("Analyze video", variant="primary")
+                    run_btn = gr.Button("Analyze video", variant="primary", interactive=False)
                     analysis_progress = gr.Markdown(min_height=48, elem_id="ddc_pose_progress")
                     analysis_note = gr.Markdown()
                 with gr.Column(scale=2):
@@ -995,8 +1058,17 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
             with gr.Row():
                 with gr.Column(scale=3):
                     people_headline = gr.Markdown()
-                    people_gallery = gr.Gallery(label="Detected people", columns=4, height=220,
-                                                object_fit="contain")
+                    # Per-run <style> that puts each person's thumbnail on their cards below.
+                    people_css = gr.HTML(elem_id="ddc_people_css")
+                    track_select = gr.CheckboxGroup(
+                        label="Include as dancer", choices=[], elem_id="ddc_track_select",
+                        info="Each card's colour matches that person's row in the timeline.")
+                    with gr.Row(elem_id="ddc_tick_row", equal_height=True):
+                        tick_all_btn = gr.Button("Tick all", size="sm", scale=0, min_width=90)
+                        tick_none_btn = gr.Button("Untick all", size="sm", scale=0, min_width=90)
+                        review_status = gr.Markdown()
+                        save_review_btn = gr.Button("Save reviewed labels", size="sm", scale=0,
+                                                    min_width=180)
                     with gr.Accordion("Fix who's who: merge, split, swap", open=False):
                         gr.Markdown("Fragments are joined automatically when the tracker lost "
                                     "someone and found them again. Fix what it got wrong:\n"
@@ -1011,7 +1083,8 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                                     "Undo steps back one change. Save corrections to keep them "
                                     "and teach future analyses. Use the timeline on the right to "
                                     "find times.")
-                        merge_select = gr.CheckboxGroup(label="People to fix", choices=[])
+                        merge_select = gr.CheckboxGroup(label="People to fix", choices=[],
+                                                       elem_id="ddc_merge_select")
                         with gr.Row():
                             fix_from = gr.Number(label="From (s)", value=None, minimum=0,
                                                  min_width=90)
@@ -1027,11 +1100,6 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                             save_merge_btn = gr.Button("Save corrections", size="sm",
                                                        variant="primary")
                         merge_status = gr.Markdown()
-                    track_select = gr.CheckboxGroup(label="Include as dancer", choices=[])
-                    with gr.Row():
-                        review_status = gr.Markdown()
-                        save_review_btn = gr.Button("Save reviewed labels", size="sm", scale=0,
-                                                    min_width=180)
                     with gr.Accordion("How the automatic selection was made", open=False):
                         predictor_note = gr.Markdown()
                 with gr.Column(scale=2):
@@ -1080,10 +1148,12 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
             report_style = gr.Radio(["Quick brief", "Guided review"], value="Guided review",
                                     label="Report style", interactive=True,
                                     info="Compare both designs using the same analysis. Switching styles does not rerun pose detection.")
-            with gr.Row(equal_height=True):
-                report_dancer = gr.Dropdown(["All dancers"], value="All dancers",
-                                            label="Feedback report for", interactive=True, scale=3)
+            with gr.Row(equal_height=False, elem_id="ddc_report_row"):
+                report_dancer = gr.Radio(["All dancers"], value="All dancers",
+                                         label="Feedback report for", interactive=True, scale=3,
+                                         elem_id="ddc_report_dancer")
                 report_download = gr.DownloadButton("Download report", visible=False, scale=1)
+            results_css = gr.HTML(elem_id="ddc_results_css")
             with gr.Row(elem_id="ddc_practice_row"):
                 with gr.Column(scale=3, elem_id="ddc_video_col"):
                     cmp_video = gr.Video(label="Your movement · green = close, red = different",
@@ -1130,13 +1200,16 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                                 "it does not certify synchronization.")
                 csv_out = gr.File(label="Download full group per-frame analysis · CSV")
 
-    people_outputs = [people_gallery, track_select, ref_dancer, merge_select, tracks_plot,
+    people_outputs = [people_css, track_select, ref_dancer, merge_select, tracks_plot,
                       predicted_overlay, predictor_note, people_headline, review_status, cmp_btn, merge_status]
     result_outputs = [result_title, cmp_video, timeline, summary_tbl, moments_tbl, cmp_note,
-                      csv_out, detail, feedback_tbl, key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download]
+                      csv_out, detail, feedback_tbl, key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download,
+                      results_css]
     review_reset_outputs = [tabs, run_title] + people_outputs + result_outputs
 
     demo.load(_runs_update, outputs=run_dd)
+    video_in.change(lambda v: gr.update(interactive=v is not None), inputs=video_in,
+                    outputs=run_btn)
     model_choice.change(
         lambda choice: (gr.update(visible=choice == MODEL_YOLO),
                         gr.update(visible=choice == MODEL_MEDIAPIPE)),
@@ -1155,34 +1228,36 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
               show_progress="hidden",
               js=_SCROLL_TOP_JS_KEEP
     ).success(run_detect, inputs=active_run, outputs=people_outputs,
-              show_progress_on=people_gallery)
+              show_progress_on=track_select)
     open_btn.click(
         lambda run: run, inputs=run_dd, outputs=active_run,
     ).success(begin_review, inputs=active_run, outputs=review_reset_outputs,
               show_progress="hidden",
               js=_SCROLL_TOP_JS_KEEP
     ).success(run_detect, inputs=active_run, outputs=people_outputs,
-              show_progress_on=people_gallery)
+              show_progress_on=track_select)
 
     merge_btn.click(run_merge, inputs=[active_run, merge_select], outputs=people_outputs,
-                    show_progress_on=people_gallery)
+                    show_progress_on=track_select)
     reset_merge_btn.click(run_reset_merges, inputs=active_run, outputs=people_outputs,
-                          show_progress_on=people_gallery)
+                          show_progress_on=track_select)
     split_btn.click(run_split, inputs=[active_run, merge_select, fix_from], outputs=people_outputs,
-                    show_progress_on=people_gallery)
+                    show_progress_on=track_select)
     swap_btn.click(run_swap, inputs=[active_run, merge_select, fix_from, fix_to],
-                   outputs=people_outputs, show_progress_on=people_gallery)
+                   outputs=people_outputs, show_progress_on=track_select)
     remove_btn.click(run_remove, inputs=[active_run, merge_select, fix_from, fix_to],
-                     outputs=people_outputs, show_progress_on=people_gallery)
+                     outputs=people_outputs, show_progress_on=track_select)
     undo_btn.click(run_undo, inputs=active_run, outputs=people_outputs,
-                   show_progress_on=people_gallery)
+                   show_progress_on=track_select)
     save_merge_btn.click(run_save_merges, inputs=active_run, outputs=merge_status,
                          show_progress_on=merge_status
     ).success(refresh_saved_merges, inputs=[active_run, merge_status], outputs=people_outputs,
-              show_progress_on=people_gallery)
+              show_progress_on=track_select)
     track_select.change(update_ref_choices, inputs=[track_select, ref_dancer],
                         outputs=ref_dancer)
     track_select.change(_review_status, inputs=track_select, outputs=review_status)
+    tick_all_btn.click(lambda: gr.update(value=_LAST.get("track_labels", [])), outputs=track_select)
+    tick_none_btn.click(lambda: gr.update(value=[]), outputs=track_select)
     ref_choice.change(
         lambda c: (gr.update(visible=c == REF_DANCER), gr.update(visible=c == REF_SOLO),
                    gr.update(visible=c == REF_SOLO), gr.update(visible=c == REF_COMPOSITE)),
@@ -1195,9 +1270,11 @@ with gr.Blocks(title="DanceDanceConvolution") as demo:
                           ref_choice, ref_dancer, solo_video, solo_offset, time_tolerance, report_style],
                   outputs=[tabs, result_title, cmp_video, timeline, summary_tbl, moments_tbl,
                            cmp_note, csv_out, t_slider, detail, review_status, feedback_tbl,
-                           key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download],
+                           key_moments_tbl, overview, practice_tbl, details_panel, report_dancer, individual_report, report_download,
+                           results_css],
                   show_progress_on=cmp_progress
-                  ).success(lambda: None, js=_SCROLL_TOP_JS)
+                  ).success(lambda: None, js=_SCROLL_TOP_JS).then(
+                      _runs_update, inputs=active_run, outputs=run_dd)
     report_dancer.change(filter_dancer_report, inputs=[report_dancer, t_slider, report_style],
                          outputs=[summary_tbl, moments_tbl, feedback_tbl, key_moments_tbl,
                                   detail, individual_report, report_download]).then(
@@ -1241,6 +1318,39 @@ _THEME = gr.themes.Base(
 )
 
 _CSS = """
+/* Person cards: thumbnails on the step-2 checklists and the step-3 dancer picker.
+   Pictures and colors come from the per-run <style> in #ddc_people_css / #ddc_results_css. */
+#ddc_people_css, #ddc_results_css { display: none !important; }
+#ddc_track_select .wrap, #ddc_merge_select .wrap, #ddc_report_dancer .wrap {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr)); gap: 10px; }
+#ddc_track_select .wrap > label, #ddc_merge_select .wrap > label, #ddc_report_dancer .wrap > label {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 6px; row-gap: 8px;
+  align-items: start; margin: 0; padding: 8px; font-size: 12px; line-height: 1.35; cursor: pointer; }
+#ddc_track_select .wrap > label::before, #ddc_merge_select .wrap > label::before,
+#ddc_report_dancer .wrap > label::before {
+  content: ''; grid-column: 1 / -1; grid-row: 1; height: 128px; border-radius: 6px;
+  /* No background-image / border-bottom-color here: the per-run rules set those, and
+     Gradio's container prefix would otherwise make these generic rules win. */
+  background-color: var(--background-fill-secondary); background-position: center;
+  background-size: contain; background-repeat: no-repeat;
+  border-bottom-width: 4px; border-bottom-style: solid; transition: opacity .15s, filter .15s; }
+#ddc_track_select .wrap > label > input, #ddc_merge_select .wrap > label > input,
+#ddc_report_dancer .wrap > label > input { grid-row: 2; margin: 1px 0 0; }
+#ddc_track_select .wrap > label > span, #ddc_merge_select .wrap > label > span,
+#ddc_report_dancer .wrap > label > span { grid-row: 2; margin: 0 !important; overflow-wrap: anywhere; }
+#ddc_track_select .wrap > label:not(:has(input:checked))::before { opacity: .35; filter: grayscale(1); }
+#ddc_merge_select .wrap > label:has(input:checked),
+#ddc_report_dancer .wrap > label:has(input:checked) { outline: 2px solid var(--body-text-color); outline-offset: -2px; }
+#ddc_report_dancer .wrap { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); }
+#ddc_report_dancer .wrap > label::before { height: 96px; border-bottom-width: 0; }
+#ddc_report_dancer .wrap > label:first-child::before {
+  content: 'Whole group'; display: grid; place-items: center; font-size: 13px;
+  color: var(--body-text-color-subdued); }
+#ddc_report_dancer .wrap > label::after {
+  grid-column: 1 / -1; grid-row: 3; font-size: 13px; font-weight: 600;
+  font-variant-numeric: tabular-nums; }
+#ddc_tick_row { align-items: center; }
+#ddc_report_row { align-items: flex-start; }
 .gradio-container { max-width: 1240px !important; padding: 32px 28px 56px !important; }
 #ddc_header { padding: 24px 28px; margin-bottom: 24px; border: 1px solid var(--border-color-primary); border-radius: 18px; background: var(--background-fill-primary); }
 #ddc_header h1 { font-size: clamp(24px, 3vw, 34px); font-weight: 600; letter-spacing: -0.045em; }
