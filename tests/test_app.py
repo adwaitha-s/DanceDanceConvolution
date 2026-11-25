@@ -7,6 +7,11 @@ from ddc.deviation import compute_deviation
 from ddc.plots import timeline_figure
 
 
+def _n_people(people_outputs):
+    """How many people step 2 shows (the Include-as-dancer choices)."""
+    return len(people_outputs[1]["choices"])
+
+
 def test_app_builds_and_lists_runs_with_readable_labels(tmp_path, monkeypatch):
     import app
 
@@ -24,11 +29,12 @@ def test_app_builds_and_lists_runs_with_readable_labels(tmp_path, monkeypatch):
     (new / "meta.json").write_text(json.dumps(
         {"video": "IMG_2326.mov", "model": app.MODEL_RTMW, "duration_s": 49.36}))
     (mediapipe / "meta.json").write_text(json.dumps({"model": app.MODEL_MEDIAPIPE}))
+    (new / "deviation.csv").write_text("")   # compared runs say so in the list
     (tmp_path / "feature_model_registry.json").write_text("{}")   # not a run
     monkeypatch.setattr(app, "RUNS_DIR", tmp_path)
 
     assert app.list_runs() == [
-        ("Oct 10 14:40 · IMG_2326.mov · 49 s", "20261010-144020"),
+        ("Oct 10 14:40 · IMG_2326.mov · 49 s · compared", "20261010-144020"),
         ("Sep 29 16:16", "20260929-161605"),
     ]
 
@@ -77,7 +83,7 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(app, 'analyze_run', lambda *a, **kw: result)
     outputs = app.run_compare(run.name, ['Person 2', 'Person 4'], 'Auto (on for 3+ dancers)',
                               False, 5, app.REF_DANCER, 'Person 2', None, 0)
-    assert len(outputs) == 19
+    assert len(outputs) == 20
     rows, feedback = outputs[4], outputs[11]
     assert len(rows) == 1 and rows[0][0] == 'Dancer 2 (Person 4)'
     assert rows[0][1] < 100 and '40/40' in rows[0][2]
@@ -115,12 +121,14 @@ def test_coaching_results_callbacks_and_reset(tmp_path, monkeypatch):
     assert len(app.begin_review(None)) == len(app.review_reset_outputs)
     assert len(app.begin_review(run.name)) == len(app.review_reset_outputs)
     reset = app.begin_review(run.name)
-    assert reset[-8:-6] == ([], [])
-    assert reset[-6] == '' and reset[-5] == ''
-    assert reset[-4]['open'] is False
-    assert reset[-1] == {'value': None, 'visible': False, '__type__': 'update'}
-    assert outputs[-4]['open'] is False
-    assert outputs[-1]['visible'] is False
+    assert reset[-9:-7] == ([], [])
+    assert reset[-7] == '' and reset[-6] == ''
+    assert reset[-5]['open'] is False
+    assert reset[-2] == {'value': None, 'visible': False, '__type__': 'update'}
+    assert reset[-1] == ''   # no dancer-card pictures left over from another run
+    assert outputs[-5]['open'] is False
+    assert outputs[-1].startswith('<style>') and 'reference' in outputs[-1]
+    assert outputs[-2]['visible'] is False
     assert 'Movement similarity' in outputs[13]
     assert 'Review left wrist' in outputs[14]
     assert len(outputs[12]) == len(key_rows)  # detailed rows remain available
@@ -327,17 +335,17 @@ def test_save_merges_button_and_reopening_use_original_automatic_ids(tmp_path, m
                         lambda name, groups, tracks: ([tr.label for tr in tracks], "test"))
     out = app.run_detect(run.name)
     assert len(out) == app.N_PEOPLE_OUTPUTS
-    assert len(out[0]) == 2
+    assert _n_people(out) == 2
     assert app._LAST["n_auto"] == 3  # further merges must use original ids
     assert app._LAST["merges"] == [[0, 2]]
     assert any(getattr(block, "value", None) == "Save corrections" for block in app.demo.blocks.values())
     assert "Corrections saved" in app.run_save_merges(run.name)
 
     reset = app.run_reset_merges(run.name)
-    assert len(reset[0]) == 3
+    assert _n_people(reset) == 3
     assert "Unsaved" in reset[-1]
     assert "Corrections saved" in app.run_save_merges(run.name)
-    assert len(app.run_detect(run.name)[0]) == 3
+    assert _n_people(app.run_detect(run.name)) == 3
 
 
 def test_cumulative_merges_remain_correct_after_reopening(tmp_path, monkeypatch):
@@ -356,7 +364,7 @@ def test_cumulative_merges_remain_correct_after_reopening(tmp_path, monkeypatch)
     app.run_merge(run.name, [labels[0], labels[2]])
     assert app._LAST["merges"] == [[0, 2, 3]]
     app.run_save_merges(run.name)
-    assert len(app.run_detect(run.name)[0]) == 2
+    assert _n_people(app.run_detect(run.name)) == 2
     assert app._LAST["merges"] == [[0, 2, 3]]
 
 
@@ -408,20 +416,20 @@ def test_split_swap_undo_and_saved_edit_log_reopen(tmp_path, monkeypatch):
     with pytest.raises(app.gr.Error, match="exactly 1"):
         app.run_split(run.name, labels[:2], t_mid)
     split = app.run_split(run.name, labels[:1], t_mid)
-    assert len(split[0]) == n + 1 and app._LAST["history"][-1]["op"] == "split"
+    assert _n_people(split) == n + 1 and app._LAST["history"][-1]["op"] == "split"
     assert "1 split" in split[-1] and "Unsaved" in split[-1]
     swapped = app.run_swap(run.name, split[1]["choices"][:2], 0, t_mid)
-    assert len(swapped[0]) == n + 1 and len(app._LAST["history"]) == 2
+    assert _n_people(swapped) == n + 1 and len(app._LAST["history"]) == 2
     undone = app.run_undo(run.name)
-    assert len(undone[0]) == n + 1 and [e["op"] for e in app._LAST["history"]] == ["split"]
+    assert _n_people(undone) == n + 1 and [e["op"] for e in app._LAST["history"]] == ["split"]
 
     assert "Corrections saved" in app.run_save_merges(run.name)
     saved = json.loads((run / "merges.json").read_text())
     assert saved == [{"op": "split", "person": 0, "frame": app._LAST["history"][0]["frame"]}]
     reopened = app.run_detect(run.name)
-    assert len(reopened[0]) == n + 1 and app._LAST["history"] == saved
+    assert _n_people(reopened) == n + 1 and app._LAST["history"] == saved
     assert "restored" in reopened[-1]
-    assert len(app.run_undo(run.name)[0]) == n
+    assert _n_people(app.run_undo(run.name)) == n
     with pytest.raises(app.gr.Error, match="Nothing to undo"):
         app.run_undo(run.name)
 
@@ -535,3 +543,25 @@ def test_report_style_switch_only_rerenders_the_report():
                 if any(app.demo.blocks[t[0]].label == 'Report style'
                        for t in d['targets'] if t[0] in app.demo.blocks)]
     assert len(handlers) == 1 and len(handlers[0]['outputs']) == 1
+
+
+def test_person_cards_get_thumbnails_timeline_colours_and_scores(monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+    import app
+    from ddc.palette import dancer_color
+    crop = np.zeros((400, 200, 3), np.uint8)
+    tracks = [SimpleNamespace(thumbnail=crop, track_id=4), SimpleNamespace(thumbnail=None, track_id=7)]
+    css = app._people_css(tracks)
+    for k in (1, 2):
+        assert f':root #ddc_track_select .wrap > label:nth-child({k})::before' in css
+        assert f':root #ddc_merge_select .wrap > label:nth-child({k})::before' in css
+        assert f'border-bottom-color: {dancer_color(k - 1)}' in css
+    assert css.count('data:image/jpeg;base64,') == 1 and 'background-image: none' in css
+    assert app._thumb_uri(crop).startswith('data:image/jpeg;base64,')
+
+    monkeypatch.setattr(app, '_LAST', {'thumbs': {4: 'data:x', 7: 'data:y'}, 'compared_ids': [4, 7]})
+    results = app._results_css(['Dancer 1', 'Dancer 2'], [81.24, 'reference'])
+    assert "label:nth-child(2)::before { background-image: url('data:x')" in results
+    assert 'content: "81.2 / 100"' in results and 'content: "reference"' in results
+    assert 'content: "no score"' in app._results_css(['Dancer 1'], [None])
