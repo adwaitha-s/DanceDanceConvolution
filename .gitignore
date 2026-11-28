@@ -14,3 +14,7 @@ models/
 
 # Web UI output directory
 runs/
+
+# Local video evaluations and in-progress imports
+/evaluation/run-*/
+/evaluation/.import-*/

@@ -22,6 +22,28 @@ outside `./runs`. `ffmpeg` on `PATH` enables browser compatible H.264 overlays.
 The detector weights download on first use. Use one running app per run
 directory, especially when the SQLite database is synced by OneDrive.
 
+## Timestamped video evaluation
+
+To run the evaluation app on its own, install its dependencies and start it from the project root.
+
+```powershell
+python -m pip install -r evaluation/requirements.txt
+python evaluation/evaluation.py
+```
+
+Open the local URL printed by the launcher (normally `http://127.0.0.1:7861`).
+A repeat launch prints the running app’s URL. If another program is using the
+default port, the launcher selects an available port. Choose **Upload video**
+or select a saved video from **Previous Runs** to display its first frame.
+Use the left and right arrow keys to step one frame at a time. Type a note and
+select **Save comment**. The timestamp stays on the frame where you began typing.
+Click a note's timestamp or its timeline marker to revisit that frame.
+
+Each upload creates a separate `evaluation/run-*/` folder containing the original
+video, playback preview, frame index, run details, and `notes.csv`. The CSV includes
+the frame number (starting at 1), timestamp, comment, and note ID. Use **Download CSV**
+to get a copy or **Previous Runs** in the upper right to reopen a saved review.
+
 ## Video and GUI workflow
 
 1. **Video:** Upload a video and select YOLO, RTMW, or MediaPipe; click

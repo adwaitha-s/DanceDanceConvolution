@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f5f7">
+  <title>DanceDanceConvolution Evaluation</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%236854f5'/%3E%3Cpath d='m13 10 9 6-9 6z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/review.css">
+  <script defer src="/assets/review.js"></script>
+</head>
+<body>
+  <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M7 3.5a1 1 0 0 1 1.5-.85l13 8.5a1 1 0 0 1 0 1.7l-13 8.5A1 1 0 0 1 7 20.5z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14m8-14v14" stroke-width="4"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V3m-4 4 4-4 4 4M4 15v5h16v-5"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="M5 5v14m13-13-9 6 9 6z"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M19 5v14M6 6l9 6-9 6z"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M3 9h4l5-4v14l-5-4H3zm13-1a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></symbol>
+    <symbol id="i-muted" viewBox="0 0 24 24"><path d="M3 9h4l5-4v14l-5-4H3zm13 1 5 5m0-5-5 5"/></symbol>
+    <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M3 9V3h6m6 0h6v6m0 6v6h-6m-6 0H3v-6"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16m10-16v16M3 9h4m-4 6h4m10-6h4m-4 6h4"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-comment" viewBox="0 0 24 24"><path d="M20 15a2 2 0 0 1-2 2H9l-5 4V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/></symbol>
+  </svg>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <span class="brand-mark"><svg aria-hidden="true"><use href="#i-play"/></svg></span>
+      <h1>DanceDanceConvolution Evaluation</h1>
+      <div class="run-menu">
+        <span aria-hidden="true">Previous Runs</span><svg aria-hidden="true"><use href="#i-chevron"/></svg>
+        <select id="runs" aria-label="Previous Runs"><option value="">No saved runs yet</option></select>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="upload-bar">
+      <button id="upload" class="upload"><svg><use href="#i-upload"/></svg>Upload video</button>
+      <input id="file" type="file" accept="video/*,.mkv,.avi,.mov,.mts,.m2ts,.wmv" hidden>
+      <span id="status" role="status"></span>
+    </div>
+    <div class="workspace">
+      <section class="video-column" aria-label="Video review">
+        <div id="player" class="player">
+          <div class="screen">
+            <video id="video" playsinline preload="auto" aria-label="Video preview"></video>
+            <span class="preview-label" id="preview-label">Preview</span>
+          </div>
+          <div class="controls">
+            <button id="play" aria-label="Play" title="Play (Space)" disabled><svg><use href="#i-play"/></svg></button>
+            <button id="volume" aria-label="Mute" title="Mute" disabled><svg><use href="#i-volume"/></svg></button>
+            <span class="time"><b id="position">00:00.000</b><span> / </span><span id="duration">00:00</span></span>
+            <div class="frame-controls">
+              <button id="prev" aria-label="Previous frame" title="Previous frame (←)" disabled><svg><use href="#i-prev"/></svg></button>
+              <span id="frame">Frame —</span>
+              <button id="next" aria-label="Next frame" title="Next frame (→)" disabled><svg><use href="#i-next"/></svg></button>
+            </div>
+            <select id="speed" aria-label="Playback speed" title="Playback speed" disabled>
+              <option value=".25">0.25×</option><option value=".5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option>
+            </select>
+            <button id="fullscreen" aria-label="Toggle fullscreen" title="Fullscreen" disabled><svg><use href="#i-fullscreen"/></svg></button>
+          </div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-heading"><h2>Timeline</h2><span id="comment-count">0 comments</span></div>
+          <div class="track">
+            <input id="scrub" type="range" aria-label="Video timeline" min="0" max="1" value="0" disabled>
+            <div id="markers"></div>
+          </div>
+          <div class="time-labels"><span>00:00</span><span id="timeline-end">00:00</span></div>
+        </div>
+        <div class="file-details">
+          <svg><use href="#i-film"/></svg><span id="filename">No video uploaded</span><span id="file-info"></span>
+        </div>
+      </section>
+      <aside class="note-column" aria-labelledby="notes-title">
+        <div class="notes-panel">
+          <div class="panel-heading">
+            <div class="title-row"><h2 id="notes-title">Notes</h2><span id="note-count" class="count">0</span><a id="csv" hidden>Download CSV</a></div>
+            <p>Be specific with commenting on fixes for individual dancers or the group as a whole.</p>
+          </div>
+          <div id="notes" class="notes-list"></div>
+          <form id="composer">
+            <div class="composer-heading">
+              <label for="comment">Note</label>
+              <span class="time-badge"><svg><use href="#i-clock"/></svg><span id="note-time">At 00:00.000</span></span>
+            </div>
+            <textarea id="comment" rows="3" placeholder="Write a note for this frame…" disabled></textarea>
+            <div class="save-hint"><span id="hint">Upload a video to add a note.</span><button id="cancel" type="button" hidden>Cancel edit</button></div>
+            <button id="save" class="save" disabled><svg><use href="#i-comment"/></svg><span>Save comment</span></button>
+          </form>
+        </div>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>
